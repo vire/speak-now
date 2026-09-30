@@ -6,7 +6,7 @@ let requests = 0;
 
 export async function generateDemo(request: Request): Promise<Response> {
   const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin) {
+  if (origin && origin !== (Bun.env.SPEAK_NOW_PUBLIC_ORIGIN ?? new URL(request.url).origin)) {
     return Response.json({ error: "Please play from the Speak Now page." }, { status: 403 });
   }
   const apiKey = Bun.env.ELEVENLABS_API_KEY;
