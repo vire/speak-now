@@ -1,5 +1,5 @@
 import { randomInt } from "node:crypto";
-import { messages } from "./demo";
+import { rooms } from "./demo";
 
 let windowStarted = Date.now();
 let requests = 0;
@@ -8,6 +8,11 @@ export async function generateDemo(request: Request): Promise<Response> {
   const origin = request.headers.get("origin");
   if (origin && origin !== (Bun.env.SPEAK_NOW_PUBLIC_ORIGIN ?? new URL(request.url).origin)) {
     return Response.json({ error: "Please play from the Speak Now page." }, { status: 403 });
+  }
+  const roomId = new URL(request.url).searchParams.get("room") ?? rooms[0]!.id;
+  const room = rooms.find((candidate) => candidate.id === roomId);
+  if (!room) {
+    return Response.json({ error: "Please choose an available room." }, { status: 400 });
   }
   const apiKey = Bun.env.ELEVENLABS_API_KEY;
   const voiceId = Bun.env.ELEVENLABS_VOICE_ID;
@@ -19,7 +24,7 @@ export async function generateDemo(request: Request): Promise<Response> {
     return Response.json({ error: "The demo is busy. Please try again in a minute." }, { status: 429, headers: { "Retry-After": "60" } });
   }
   requests++;
-  const text = messages[randomInt(messages.length)]!;
+  const text = room.messages[randomInt(room.messages.length)]!;
   try {
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
       method: "POST",
