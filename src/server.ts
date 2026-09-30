@@ -1,14 +1,11 @@
+import { generateDemo } from "./demo-speech";
+
 const port = Number(Bun.env.PORT ?? 3000);
 
 Bun.serve({
   port,
   routes: {
-    "/demo/completed.mp3": () => new Response(Bun.file("public/demo/completed.mp3"), {
-      headers: { "Content-Type": "audio/mpeg" },
-    }),
-    "/demo/needs-input.mp3": () => new Response(Bun.file("public/demo/needs-input.mp3"), {
-      headers: { "Content-Type": "audio/mpeg" },
-    }),
+    "/api/demo/speech": { POST: generateDemo },
     "/api/health": () => Response.json({ status: "ok" }),
     "/api/hello": () => Response.json({ message: "Hello from Speak Now!" }),
     "/assets/client.js": () => new Response(Bun.file("public/assets/client.js"), {

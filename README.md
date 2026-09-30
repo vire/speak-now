@@ -13,7 +13,7 @@ bun install
 bun run dev
 ```
 
-Open <http://localhost:3000>. The UI displays two hardcoded sample agent updates with Play buttons. Each button plays a bundled MP3 generated with the SN-01 speech provider. The public demo needs no Herdr connection or production speech credentials. The development command rebuilds the client once when it starts and watches the server; run `bun run build:client` after editing client code to refresh the browser bundle.
+Open <http://localhost:3000>. The Play button chooses a random sample agent update and generates fresh audio through ElevenLabs on each click. Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in the server environment. The development command rebuilds the client once when it starts and watches the server; run `bun run build:client` after editing client code to refresh the browser bundle.
 
 ## API
 
@@ -41,4 +41,4 @@ docker run --rm -p 3000:3000 speak-now
 
 ## Public playback demo
 
-Demo messages are defined in `src/demo.ts`; their matching audio files live in `public/demo/`. Update both together. These MP3s are intentional public demo assets, separate from private captured transcripts and runtime audio under `data/`. Playback begins on a button click, stops the previous clip, and supports replay after completion.
+`POST /api/demo/speech` chooses one of the sample messages in `src/demo.ts` and calls ElevenLabs server-side. The API key stays in the server environment. The response contains an MP3 and its text in `X-Demo-Message`; the browser displays the message and plays the audio with native playback controls. Generation is limited to 20 requests per minute per server process. Configure the speech credentials as runtime-only secrets in production.
