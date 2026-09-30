@@ -1,38 +1,25 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { rooms } from "./demo";
 
 function App() {
   const [roomId, setRoomId] = useState(rooms[0]!.id);
   const room = rooms.find((candidate) => candidate.id === roomId)!;
-  const [loading, setLoading] = useState(false);
+  const [playbackId, setPlaybackId] = useState(0);
   const [message, setMessage] = useState<string>();
   const [audioUrl, setAudioUrl] = useState<string>();
   const [error, setError] = useState<string>();
   const player = useRef<HTMLAudioElement | null>(null);
 
-  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
-
-  async function play(nextRoomId: string) {
-    if (loading) return;
+  function play(nextRoomId: string) {
+    const nextRoom = rooms.find((candidate) => candidate.id === nextRoomId)!;
+    const index = Math.floor(Math.random() * nextRoom.messages.length);
     player.current?.pause();
     setRoomId(nextRoomId);
-    setMessage(undefined);
-    setAudioUrl(undefined);
-    setLoading(true);
+    setMessage(nextRoom.messages[index]);
+    setAudioUrl(`/audio/${nextRoom.id}-${index + 1}.mp3`);
+    setPlaybackId((id) => id + 1);
     setError(undefined);
-    try {
-      const response = await fetch(`/api/demo/speech?room=${encodeURIComponent(nextRoomId)}`, { method: "POST" });
-      if (!response.ok) {
-        const data = await response.json() as { error?: string };
-        throw new Error(data.error ?? "Could not generate speech. Please try again.");
-      }
-      const blob = await response.blob();
-      setMessage(response.headers.get("X-Demo-Message") ?? "Sample agent update");
-      setAudioUrl(URL.createObjectURL(blob));
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Could not generate speech. Please try again.");
-    } finally { setLoading(false); }
   }
 
   return (
@@ -63,19 +50,19 @@ function App() {
               ))}
             </ol>
             <button className="play-button" type="button" aria-label={`Play a random ${candidate.name} message`}
-              onClick={() => void play(candidate.id)} disabled={loading}>
-              <span aria-hidden="true">▶</span> {loading && candidate.id === roomId ? "Generating…" : "Play channel"}
+              onClick={() => play(candidate.id)}>
+              <span aria-hidden="true">▶</span> Play channel
             </button>
           </section>
         ))}
       </div>
       <footer className="playback">
-        <div className="playback-info"><span className={`dot ${loading ? "busy" : ""}`} /><div>
-          <strong>{loading ? "Generating voice…" : audioUrl ? room.name : "Ready to listen"}</strong>
-          <p role="status">{message ?? (loading ? `Preparing an update from ${room.name}` : "Choose a channel to hear a sample update")}</p>
+        <div className="playback-info"><span className="dot" /><div>
+          <strong>{audioUrl ? room.name : "Ready to listen"}</strong>
+          <p role="status">{message ?? "Choose a channel to hear a sample update"}</p>
         </div></div>
-        {audioUrl && <audio key={audioUrl} ref={player} src={audioUrl} controls autoPlay
-          aria-label={`Generated ${room.name} update`} onError={() => setError("Could not play the audio. Please try again.")} />}
+        {audioUrl && <audio key={playbackId} ref={player} src={audioUrl} controls autoPlay
+          aria-label={`${room.name} sample update`} onError={() => setError("Could not play the audio. Please try again.")} />}
         {error && <p className="error" role="alert">{error}</p>}
       </footer>
     </main>
