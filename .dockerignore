@@ -2,3 +2,6 @@ node_modules
 public/assets
 .git
 .env
+tmp
+data
+.agents/worktrees

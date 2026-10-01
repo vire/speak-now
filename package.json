@@ -8,7 +8,8 @@
     "build:client": "bun build src/client.tsx --target browser --outdir public/assets --minify",
     "build": "bun run build:client",
     "start": "bun src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src"
   },
   "dependencies": {
     "react": "^19.0.0",
