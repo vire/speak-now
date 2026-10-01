@@ -22,6 +22,29 @@ Speak Now uses Bun, TypeScript, and React to turn existing Herdr agent updates i
 - Agents must not add `merge-authorized` themselves to authorize a merge.
 - Direct pushes or force pushes that would cause an open PR to be marked merged require the same label check.
 
+## Behavior changes
+
+- **Spec -> test -> code, in that order. Always.** Every behavior change follows the triad:
+
+  1. **Spec** - the intended behavior is written down before any test or code exists. The task as stated,
+     a Linear issue, or a `docs/plans/*.md` all count; if none covers the change, write the spec yourself
+     (a paragraph is enough) where the reviewer will read it: the top of the PR description, or the
+     hand-back when the change stays in the working tree. An agent-written spec counts, and nobody's
+     approval gates the next step. What makes it a spec is that it comes first and is concrete: the
+     behavior, the inputs and outcomes a test can check, and what is out of scope, taken from the task,
+     never from the code. Ask only when the task reads two ways that would lead to different tests.
+  2. **Test** - a test written from the spec (unit test, `eve eval`, or policy test), run on its own and
+     seen to fail for the right reason. Where no test can express the spec (compose, Dockerfiles, `infra/`,
+     `seed.json`, teach HTML, docs), the gate is the CI job step that covers the file.
+  3. **Implementation** - code is written only to make those tests pass.
+
+  Never write a new unit test after the implementation it covers: a test written against finished code
+  asserts what the code does, not what the spec requires. If the behavior you are changing has no test
+  yet, go back to step 1 - state the intended behavior from the issue, the docs or the task, write it
+  down, then write the test from that statement, not from the code. A bug fix is the same triad: the
+  issue is the spec, the regression test reproduces it and fails on `main`, the fix makes it pass. Pure
+  refactors keep the existing tests green and need no new spec.
+
 ## Setup and verification
 
 - Use Bun 1.3 or newer. Run `bun install` in each new checkout, then `bun run dev` for local development at `http://localhost:3000`.
