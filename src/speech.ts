@@ -2,8 +2,10 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { Logger } from "./logging";
+import type { TraceContext } from "./shared";
+import type { Tracer } from "./tracing";
 
-export interface SpeechConfig { apiKey?: string; voiceId?: string; dataDir: string; model?: string; timeoutMs?: number; logger?: Logger; operationId?: string; jobId?: string; }
+export interface SpeechConfig { apiKey?: string; voiceId?: string; dataDir: string; model?: string; timeoutMs?: number; logger?: Logger; tracer?: Tracer; trace?: TraceContext; operationId?: string; jobId?: string; }
 export interface Clip { path: string; cached: boolean; }
 const pending = new Map<string, Promise<Clip>>();
 const audioLimit = 20_000_000;
@@ -48,6 +50,7 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
   const log = config.logger;
   const fields = { operationId: config.operationId, jobId: config.jobId, clipKey: key };
   if (!config.apiKey || !config.voiceId) {
+    await config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId }).end("rejected");
     await log?.log("error", { operation: "speech.synthesize", message: "Speech configuration is unavailable", outcome: "rejected", jobId: config.jobId, metadata: fields });
     throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required for live speech");
   }
@@ -57,7 +60,7 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
   const directory = join(config.dataDir, "audio");
   const cacheKey = createHash("sha256").update(`${key}\0${voiceId}\0${config.model ?? "eleven_flash_v2_5"}`).digest("hex");
   const path = join(directory, `${cacheKey}.mp3`);
-  if (await Bun.file(path).exists()) { await log?.log("info", { operation: "media.cache", message: "Reused cached audio", outcome: "cached", jobId: config.jobId, metadata: fields }); return { path, cached: true }; }
+  if (await Bun.file(path).exists()) { await config.tracer?.start("media.cache", { ...config.trace, jobId: config.jobId, clipId: cacheKey }).end("cached"); await log?.log("info", { operation: "media.cache", message: "Reused cached audio", outcome: "cached", jobId: config.jobId, metadata: fields }); return { path, cached: true }; }
   const existing = pending.get(cacheKey);
   if (existing) return existing;
   const work = (async () => {
@@ -66,7 +69,10 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
     const controller = new AbortController();
     const cancel = () => controller.abort();
     signal?.addEventListener("abort", cancel, { once: true });
-    const deadline = setTimeout(cancel, timeoutMs);
+    let timedOut = false;
+    const deadline = setTimeout(() => { timedOut = true; cancel(); }, timeoutMs);
+      const providerSpan = config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId, clipId: cacheKey });
+      let mediaSpan: ReturnType<NonNullable<typeof config.tracer>["start"]> | undefined;
       try {
         await log?.log("info", { operation: "speech.synthesize", message: "Started speech request", outcome: "started", jobId: config.jobId, metadata: fields });
       if (signal?.aborted) throw cancellationError();
@@ -80,13 +86,18 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
       if (!response.ok) throw new Error(`ElevenLabs returned ${response.status}`);
       if (!response.body) throw new Error("ElevenLabs returned no audio body");
       const audio = await readAudio(response.body, controller.signal);
+      await providerSpan?.end("succeeded", { metadata: { status: response.status } });
+      mediaSpan = config.tracer?.start("media.write", { ...providerSpan?.context, jobId: config.jobId, clipId: cacheKey });
       await writeFile(temporary, audio);
       if (controller.signal.aborted) throw cancellationError();
         await rename(temporary, path);
+        await mediaSpan?.end("succeeded");
         await log?.log("info", { operation: "media.write", message: "Published audio clip", outcome: "succeeded", jobId: config.jobId, metadata: fields });
         return { path, cached: false };
       } catch (error) {
         await rm(temporary, { force: true });
+        await mediaSpan?.end(controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
+        await providerSpan?.end(timedOut ? "timed_out" : controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
         await log?.log("error", { operation: "speech.synthesize", message: "Speech request failed", outcome: "failed", jobId: config.jobId, metadata: { ...fields, error: error instanceof Error ? error.message : "unknown" } });
         throw error;
     } finally {

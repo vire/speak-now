@@ -9,6 +9,8 @@ export type ParticipantId = string & { readonly participantId: unique symbol };
 export type CaptureMode = "structured" | "terminal";
 export type CaptureStatus = "complete" | "partial" | "gap" | "limited";
 
+export interface TraceContext { traceId: string; spanId: string; parentSpanId?: string; sourceId?: string; participantId?: string; jobId?: string; announcementId?: string; clipId?: string; }
+
 export interface Source {
   id: SourceId;
   namespace: string;
@@ -79,6 +81,7 @@ export interface Activity {
   truncated: boolean;
   excerpt: "full" | "tail";
   originalTextBytes: number;
+  trace?: TraceContext;
 }
 
 export interface ListeningScope {
