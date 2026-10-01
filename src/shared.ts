@@ -84,11 +84,6 @@ export interface Activity {
   trace?: TraceContext;
 }
 
-export interface SummaryJob { id: string; trace?: TraceContext; }
-export interface Announcement { id: string; trace?: TraceContext; }
-export interface AudioClip { id: string; trace?: TraceContext; }
-export interface PlaybackAttempt { id: string; trace?: TraceContext; }
-
 export interface ListeningScope {
   sourceId: SourceId;
   workspaceId?: WorkspaceId;

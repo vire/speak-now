@@ -4,6 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTracer } from "../src/tracing";
 
+const traceText = async (traces: string) => {
+  const writers = (await readdir(traces, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith("writer-"));
+  const texts = await Promise.all(writers.map(async (entry) => Promise.all((await readdir(join(traces, entry.name))).filter((name) => name.endsWith(".jsonl")).map((name) => readFile(join(traces, entry.name, name), "utf8")))));
+  return texts.flat().join("");
+};
+const traceFiles = async (traces: string) => {
+  const writers = (await readdir(traces, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith("writer-"));
+  return (await Promise.all(writers.map(async (entry) => Promise.all((await readdir(join(traces, entry.name))).filter((name) => name.endsWith(".jsonl")).map(async (name) => ({ name, text: await readFile(join(traces, entry.name, name), "utf8") })))))).flat();
+};
+
 // Contract: local calls form a bounded, redactable parent-child trace that can be followed without captured evidence.
 // Regression: a recorder could emit an unclosed child span or leak request secrets into calls.jsonl.
 test("records closed correlated spans without evidence or credentials", async () => {
@@ -16,7 +26,7 @@ test("records closed correlated spans without evidence or credentials", async ()
     await root.end("succeeded");
     await tracer.flush();
 
-    const text = await readFile(join(dataDir, "traces", "calls.jsonl"), "utf8");
+    const text = await traceText(join(dataDir, "traces"));
     const records = text.trim().split("\n").map(JSON.parse);
     expect(records).toHaveLength(2);
     const parent = records.find((record) => record.operation === "capture.update");
@@ -49,8 +59,7 @@ test("repairs and retains bounded redacted trace files", async () => {
     const tracer = createTracer({ dataDirectory: dataDir, maxFileBytes: 384, maxRetainedFiles: 6 });
     for (let index = 0; index < 6; index += 1) await tracer.start(`trace.${index}`, { metadata: { requestId: `Basic synthetic-${index}`, detail: `password=synthetic-${index}` } }).end("succeeded");
     await tracer.flush();
-    const files = await readdir(traces);
-    const lines = (await Promise.all(files.filter((name) => name.endsWith(".jsonl")).map((name) => readFile(join(traces, name), "utf8")))).flatMap((text) => text.trim().split("\n").filter(Boolean));
+    const lines = (await traceText(traces)).trim().split("\n").filter(Boolean);
     expect(lines).toHaveLength(6);
     expect(lines.every((line) => { try { JSON.parse(line); return true; } catch { return false; } })).toBe(true);
     expect(lines.join("\n")).not.toContain("synthetic-");
@@ -69,7 +78,7 @@ test("expires aged active rows while later rows continue", async () => {
     await Bun.sleep(30);
     await tracer.start("current").end("succeeded");
     await tracer.flush();
-    const operations = (await readFile(join(dataDir, "traces", "calls.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).operation);
+    const operations = (await traceText(join(dataDir, "traces")).then((text) => text.trim())).split("\n").map((line) => JSON.parse(line).operation);
     expect(operations).toEqual(["current"]);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
@@ -82,7 +91,7 @@ test("expires old rows during continuous writes", async () => {
     const tracer = createTracer({ dataDirectory: dataDir, retentionDays: 100 / 86_400_000 });
     for (let index = 0; index < 7; index += 1) { await tracer.start(`row-${index}`).end("succeeded"); await Bun.sleep(20); }
     await tracer.flush();
-    const rows = (await readFile(join(dataDir, "traces", "calls.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const rows = (await traceText(join(dataDir, "traces")).then((text) => text.trim())).split("\n").map((line) => JSON.parse(line));
     expect(rows.every((row) => Date.now() - Date.parse(row.endedAt) <= 120)).toBe(true);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
@@ -99,7 +108,7 @@ test("expires old rows from rotated archives", async () => {
     const tracer = createTracer({ dataDirectory: dataDir, retentionDays: 100 / 86_400_000 });
     await tracer.start("append").end("succeeded");
     await tracer.flush();
-    const archive = await readFile(join(traces, "calls.recent.jsonl"), "utf8");
+    const archive = await traceText(traces);
     expect(archive).not.toContain("expired");
     expect(archive).toContain("current");
   } finally { await rm(dataDir, { recursive: true, force: true }); }
@@ -119,74 +128,9 @@ test("rejects malformed UTF-8 rows while retaining later Unicode rows", async ()
     const tracer = createTracer({ dataDirectory: dataDir });
     await tracer.start("append").end("succeeded");
     await tracer.flush();
-    const archive = await readFile(join(traces, "calls.utf8.jsonl"), "utf8");
+    const archive = await traceText(traces);
     expect(archive).not.toContain("bad-");
     expect(archive).toContain("café 😀 日本語");
-  } finally { await rm(dataDir, { recursive: true, force: true }); }
-});
-
-// Contract: a live writer's permanent kernel guard excludes another recorder before it can repair or append.
-// Regression: an age-only or pathname-only lock allowed a contender to mutate calls.jsonl while an owner was paused.
-test("does not mutate traces while a live fixture holds the permanent guard", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-live-guard-"));
-  const traces = join(dataDir, "traces");
-  const guard = join(traces, ".calls.guard");
-  const addon = join(process.cwd(), "native", "flock_guard.node");
-  const fixture = `import { open } from "node:fs/promises"; import { createRequire } from "node:module"; const handle = await open(process.argv[1], "a+"); const flock = createRequire(import.meta.url)(process.argv[2]); if (flock.lock(handle.fd) !== 0) throw new Error("fixture guard unavailable"); console.log("ready"); await new Response(Bun.stdin.stream()).text(); await handle.close();`;
-  try {
-    await mkdir(traces, { recursive: true });
-    const holder = Bun.spawn([process.execPath, "-e", fixture, guard, addon], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const reader = holder.stdout.getReader();
-    const ready = await reader.read();
-    reader.releaseLock();
-    expect(new TextDecoder().decode(ready.value).includes("ready")).toBe(true);
-    const tracer = createTracer({ dataDirectory: dataDir });
-    const pending = tracer.start("excluded").end("succeeded");
-    await Bun.sleep(30);
-    expect(await Bun.file(join(traces, "calls.jsonl")).exists()).toBe(false);
-    holder.stdin.end();
-    await holder.exited;
-    await pending;
-    await tracer.flush();
-    expect(await Bun.file(join(traces, "calls.jsonl")).exists()).toBe(true);
-  } finally { await rm(dataDir, { recursive: true, force: true }); }
-});
-
-// Contract: a complete atomically published owner from a dead fixture is recoverable, while canonical publication never overwrites it.
-// Regression: stale recovery either stranded recording forever or could delete a successor after observing an earlier owner.
-test("recovers a complete owner published by a dead fixture without replacing artifacts", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-dead-owner-"));
-  const traces = join(dataDir, "traces");
-  const canonical = join(traces, ".calls.lock");
-  const fixture = `import { link, mkdir, writeFile } from "node:fs/promises"; import { join } from "node:path"; const directory = process.argv[1]; await mkdir(directory, { recursive: true }); const token = "fixture-token-0123456789"; const candidate = join(directory, ".calls.owner.fixture"); await writeFile(candidate, JSON.stringify({ version: 1, pid: process.pid, token })); await link(candidate, join(directory, ".calls.lock")); console.log("published");`;
-  try {
-    const owner = Bun.spawn([process.execPath, "-e", fixture, traces], { stdout: "pipe", stderr: "pipe" });
-    expect((await new Response(owner.stdout).text()).includes("published")).toBe(true);
-    expect(await owner.exited).toBe(0);
-    expect((await stat(canonical)).isFile()).toBe(true);
-    const tracer = createTracer({ dataDirectory: dataDir });
-    await tracer.start("after-dead-owner").end("succeeded");
-    await tracer.flush();
-    expect((await readFile(join(traces, "calls.jsonl"), "utf8"))).toContain("after-dead-owner");
-    expect(await Bun.file(canonical).exists()).toBe(false);
-  } finally { await rm(dataDir, { recursive: true, force: true }); }
-});
-
-// Contract: a canonical artifact without complete ownership metadata is unavailable and remains untouched.
-// Regression: an age-based cleanup could delete an external or interrupted owner and silently steal its trace destination.
-test("keeps an ambiguous canonical owner artifact conservative", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-ambiguous-owner-"));
-  const traces = join(dataDir, "traces");
-  const canonical = join(traces, ".calls.lock");
-  try {
-    await mkdir(traces, { recursive: true });
-    await writeFile(canonical, "");
-    const tracer = createTracer({ dataDirectory: dataDir });
-    await tracer.start("must-not-steal").end("succeeded");
-    await tracer.flush();
-    expect(await readFile(canonical, "utf8")).toBe("");
-    expect(await Bun.file(join(traces, "calls.jsonl")).exists()).toBe(false);
-    expect(tracer.getStatus().droppedEntries).toBe(1);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
 
@@ -199,39 +143,95 @@ test("expires aged rows from archives during continued rotation", async () => {
     for (let index = 0; index < 5; index += 1) { await tracer.start(`rotated-${index}`).end("succeeded"); if (index < 4) await Bun.sleep(100); }
     await tracer.flush();
     const traces = join(dataDir, "traces");
-    const rows = (await Promise.all((await readdir(traces)).filter((name) => name.endsWith(".jsonl")).map(async (name) => (await readFile(join(traces, name), "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse)))).flat();
+    const files = await traceFiles(traces);
+    const rows = files.flatMap((file) => file.text.trim().split("\n").filter(Boolean).map(JSON.parse));
+    expect(files.some((file) => file.name !== "calls.jsonl")).toBe(true);
+    expect(rows.some((row) => row.operation === "rotated-4")).toBe(true);
     expect(rows.every((row: { endedAt: string }) => Date.now() - Date.parse(row.endedAt) < 350)).toBe(true);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
 
-// Contract: a real busy guard uses monotonic elapsed time, so an adjusted wall clock cannot postpone the bounded diagnostic.
-// Regression: Date.now-based retry deadlines waited until a live holder released after a simulated backward clock step.
-test("keeps the busy guard deadline monotonic across a wall-clock rollback", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-clock-"));
-  const guard = join(dataDir, "traces", ".calls.guard");
-  const addon = join(process.cwd(), "native", "flock_guard.node");
-  const fixture = `import { mkdir, open } from "node:fs/promises"; import { createRequire } from "node:module"; await mkdir(process.argv[1], { recursive: true }); const handle = await open(process.argv[2], "a+"); const flock = createRequire(import.meta.url)(process.argv[3]); if (flock.lock(handle.fd) !== 0) throw new Error("fixture guard unavailable"); console.log("ready"); await new Response(Bun.stdin.stream()).text(); await handle.close();`;
-  const originalNow = Date.now;
-  let holder: ReturnType<typeof Bun.spawn> | undefined;
+// Contract: a successful rotation enforces the final per-writer file budget, including the newly created active file.
+// Regression: pruning only before rotation retained one archive plus the replacement active file at a one-file budget.
+test("keeps the final per-writer budget after rotation", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-final-budget-"));
   try {
-    holder = Bun.spawn([process.execPath, "-e", fixture, join(dataDir, "traces"), guard, addon], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const reader = holder.stdout.getReader(); const ready = await reader.read(); reader.releaseLock();
-    expect(new TextDecoder().decode(ready.value).includes("ready")).toBe(true);
-    let reads = 0;
-    Date.now = () => ++reads === 1 ? originalNow() : originalNow() - 60_000;
-    const tracer = createTracer({ dataDirectory: dataDir });
-    const started = performance.now();
-    let settled = false;
-    const pending = tracer.start("clock-rollback").end("succeeded").finally(() => { settled = true; });
-    await Bun.sleep(2_150);
-    expect(settled).toBe(true);
-    expect(performance.now() - started).toBeLessThan(2_250);
-    expect(tracer.getStatus().droppedEntries).toBe(1);
-    await pending;
-  } finally {
-    Date.now = originalNow;
-    holder?.stdin.end();
-    if (holder) await holder.exited;
-    await rm(dataDir, { recursive: true, force: true });
-  }
+    const tracer = createTracer({ dataDirectory: dataDir, maxFileBytes: 256, maxRetainedFiles: 1 });
+    for (let index = 0; index < 4; index += 1) await tracer.start(`budget-${index}`).end("succeeded");
+    await tracer.flush();
+    const files = await traceFiles(join(dataDir, "traces"));
+    expect(files).toHaveLength(1);
+    expect(files[0].text.length).toBeLessThanOrEqual(256);
+    expect(tracer.getStatus().droppedEntries).toBe(0);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+// Contract: independent live recorders own separate generation directories and never contend for one mutable file.
+// Regression: the shared canonical destination required a lock and could drop a live writer's span.
+test("isolates independent live writers in never-reused generations", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-writers-"));
+  const fixture = `import { createTracer } from ${JSON.stringify(join(process.cwd(), "src/tracing.ts"))}; const t=createTracer({dataDirectory:process.argv[1]}); await t.start("child-writer").end("succeeded"); await t.flush();`;
+  try {
+    const child = Bun.spawn([process.execPath, "-e", fixture, dataDir], { stdout: "ignore", stderr: "pipe" });
+    const parent = createTracer({ dataDirectory: dataDir }); await parent.start("parent-writer").end("succeeded"); await parent.flush();
+    expect(await child.exited).toBe(0);
+    const writers = (await readdir(join(dataDir, "traces"), { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith("writer-"));
+    expect(writers).toHaveLength(2);
+    const text = await traceText(join(dataDir, "traces"));
+    expect(text).toContain("parent-writer"); expect(text).toContain("child-writer");
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+// Contract: a later append claims a generation from an actually exited owned process by move before bounded repair, preserving complete rows once.
+// Regression: one-time startup recovery left a generation that died after startup outside retention forever.
+test("recovers a dead generation during later maintenance", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-reclaim-"));
+  try {
+    const tracer = createTracer({ dataDirectory: dataDir }); await tracer.start("before-death").end("succeeded"); await tracer.flush();
+    const traces = join(dataDir, "traces"); const control = join(dataDir, "dead-control"); await mkdir(control);
+    const child = Bun.spawn([process.execPath, join(process.cwd(), "test/fixtures/tracing-generation.ts"), dataDir, control, "claimed-once", "exit-with-partial"], { stdout: "ignore", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    await tracer.start("after-death").end("succeeded"); await tracer.flush();
+    const text = await traceText(traces);
+    expect(text.match(/claimed-once/g)?.length).toBe(1); expect(text).toContain("after-death");
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+// Contract: competing reclaimers may each observe death, but atomic source moves retain an eligible row at most once.
+// Regression: stale shared-owner cleanup could delete a successor or duplicate reclaimed trace data.
+test("lets competing reclaimers claim a dead generation once", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-competing-"));
+  const fixture = join(process.cwd(), "test/fixtures/tracing-generation.ts");
+  try {
+    const traces = join(dataDir, "traces"); const exited = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" }); await exited.exited;
+    const dead = join(traces, `writer-${exited.pid}-seed-dead`); await mkdir(dead, { recursive: true });
+    await writeFile(join(dead, "calls.jsonl"), `${JSON.stringify({ endedAt: new Date().toISOString(), operation: "claimed-once" })}\n`);
+    const controlA = join(dataDir, "control-a"); const controlB = join(dataDir, "control-b"); await mkdir(controlA); await mkdir(controlB);
+    const first = Bun.spawn([process.execPath, fixture, dataDir, controlA, "reclaimer-a", "root-gate"], { stdout: "ignore", stderr: "pipe" });
+    while (!(await Bun.file(join(controlA, "ready")).exists())) await Bun.sleep(2);
+    const second = Bun.spawn([process.execPath, fixture, dataDir, controlB, "reclaimer-b"], { stdout: "ignore", stderr: "pipe" });
+    expect(await second.exited).toBe(0);
+    await writeFile(join(controlA, "go"), "go");
+    expect(await first.exited).toBe(0);
+    const statuses = await Promise.all([controlA, controlB].map(async (control) => JSON.parse(await readFile(join(control, "result.json"), "utf8"))));
+    const text = await traceText(traces);
+    expect(text.match(/claimed-once/g)?.length).toBe(1);
+    expect(text).toContain("reclaimer-a"); expect(text).toContain("reclaimer-b");
+    expect(statuses.every((status) => status.droppedEntries === 0)).toBe(true);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+// Contract: a stopped legacy root file is moved once into the first private generation and bounded repair makes later starts idempotent.
+// Regression: legacy calls could remain outside retention or be copied repeatedly on restart.
+test("migrates a quiescent legacy trace once", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-migration-"));
+  const fixture = `import { createTracer } from ${JSON.stringify(join(process.cwd(), "src/tracing.ts"))}; const t = createTracer({ dataDirectory: process.argv[1] }); await t.start("restarted").end("succeeded"); await t.flush();`;
+  try {
+    const traces = join(dataDir, "traces"); await mkdir(traces, { recursive: true });
+    await writeFile(join(traces, "calls.jsonl"), `${JSON.stringify({ endedAt: new Date().toISOString(), operation: "legacy-row" })}\n{partial`);
+    const first = createTracer({ dataDirectory: dataDir }); await first.start("first").end("succeeded"); await first.flush();
+    const second = Bun.spawn([process.execPath, "-e", fixture, dataDir], { stdout: "ignore", stderr: "pipe" }); expect(await second.exited).toBe(0);
+    const text = await traceText(traces);
+    expect(text.match(/legacy-row/g)?.length).toBe(1); expect(await Bun.file(join(traces, "calls.jsonl")).exists()).toBe(false);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
 });

@@ -4,10 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run build:native && bun run build:client && bun --watch src/server.ts",
+    "dev": "bun run build:client && bun --watch src/server.ts",
     "build:client": "bun build src/client.tsx --target browser --outdir public/assets --minify",
-    "build:native": "bun scripts/build-flock-guard.mjs",
-    "build": "bun run build:native && bun run build:client",
+    "build": "bun run build:client",
     "start": "bun src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test ./src ./test"

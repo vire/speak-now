@@ -53,7 +53,7 @@ bun run build
 bun run start
 ```
 
-Trace recording also builds a small local Node-API `flock` guard. `bun run build` discovers headers from a standard local Node installation, or accepts `NODE_API_INCLUDE` when headers live elsewhere. The Docker build installs Linux headers and compiles the matching runtime module. The guard supports macOS and Linux only; network filesystems and other platforms are not claimed.
+Trace files are local JSONL files under `data/traces/writer-*/`. Each process owns one unique writer directory; inspect traces by aggregating those files and correlating IDs. `maxRetainedFiles` and `maxFileBytes` apply to each live writer, including its active file and reclaimed archives, so there is no global append order or total-file budget. A live idle writer is reconciled only on its next append. The recorder uses Bun and standard filesystem APIs only. Dead generations are recovered only on the same host and PID namespace after an `ESRCH` liveness result; network filesystems and other platforms are not claimed. Legacy root JSONL migration is quiescent and idempotent: stop older writers before the first generation starts.
 
 ## Docker
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { synthesize } from "./speech";
@@ -60,7 +60,8 @@ test("traces a cancelled provider request", async () => {
     await expect(work).rejects.toThrow("cancelled");
     await parent.end("cancelled");
     await tracer.flush();
-    const records = (await readFile(join(dataDir, "traces", "calls.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const traces = join(dataDir, "traces");
+    const records = (await Promise.all((await readdir(traces, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith("writer-")).map(async (entry) => Promise.all((await readdir(join(traces, entry.name))).filter((name) => name.endsWith(".jsonl")).map(async (name) => (await Bun.file(join(traces, entry.name, name)).text()).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))))))).flat(2);
     expect(records.find((record) => record.operation === "speech.provider")).toMatchObject({ traceId: "trace-a", parentSpanId: parent.context.spanId, jobId: "job-a", outcome: "cancelled" });
   } finally {
     await rm(dataDir, { recursive: true, force: true });
