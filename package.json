@@ -9,7 +9,7 @@
     "build": "bun run build:client",
     "start": "bun src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test ./src"
+    "test": "bun test ./src ./test"
   },
   "dependencies": {
     "react": "^19.0.0",
