@@ -16,7 +16,9 @@ Speak Now uses Bun, TypeScript, and React to turn existing Herdr agent updates i
 - Give concurrent features separate worktrees. Preserve unrelated changes in the main checkout and other worktrees. Commit only files belonging to the current task; integrate completed feature branches after their verification and review.
 - Worktree directories are local, ignored artifacts. Keep `.agents/worktrees/` excluded from Git and Docker build context.
 
-## Pull request merge authorization
+## Pull requests
+
+- Open normal pull requests ready for review. Never open a draft PR unless the user explicitly instructs "Open Draft PR". Pending review or verification belongs in the PR description and does not authorize draft status.
 
 - Agents must never merge a pull request unless it currently has the `merge-authorized` label. Check the live labels immediately before merging; if the label is absent or cannot be verified, leave the PR open and report that merge authorization is missing.
 - Agents must not add `merge-authorized` themselves to authorize a merge.
