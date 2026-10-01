@@ -16,6 +16,12 @@ Speak Now uses Bun, TypeScript, and React to turn existing Herdr agent updates i
 - Give concurrent features separate worktrees. Preserve unrelated changes in the main checkout and other worktrees. Commit only files belonging to the current task; integrate completed feature branches after their verification and review.
 - Worktree directories are local, ignored artifacts. Keep `.agents/worktrees/` excluded from Git and Docker build context.
 
+## Pull request merge authorization
+
+- Agents must never merge a pull request unless it currently has the `merge-authorized` label. Check the live labels immediately before merging; if the label is absent or cannot be verified, leave the PR open and report that merge authorization is missing.
+- Agents must not add `merge-authorized` themselves to authorize a merge.
+- Direct pushes or force pushes that would cause an open PR to be marked merged require the same label check.
+
 ## Setup and verification
 
 - Use Bun 1.3 or newer. Run `bun install` in each new checkout, then `bun run dev` for local development at `http://localhost:3000`.
