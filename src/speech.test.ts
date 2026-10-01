@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { synthesize } from "./speech";
+import { createTracer } from "./tracing";
 
 test("writes and reuses the deterministic ElevenLabs provider-contract fixture", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "speak-now-speech-test-"));
@@ -39,6 +40,28 @@ test("aborts a provider body and removes its temporary clip", async () => {
     await expect(work).rejects.toThrow("cancelled");
     expect(cancelled).toBe(true);
     expect(await readdir(join(dataDir, "audio"))).toEqual([]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Contract: a cancelled provider call closes its own child span and the media write is absent.
+// Regression: cancellation previously left a provider operation without an observable terminal outcome.
+test("traces a cancelled provider request", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-speech-trace-"));
+  const controller = new AbortController();
+  const tracer = createTracer({ dataDirectory: dataDir });
+  const parent = tracer.start("collector.job", { traceId: "trace-a", jobId: "job-a", participantId: "participant-a" });
+  const fixtureFetch = (async () => new Response(new ReadableStream<Uint8Array>({ start(stream) { stream.enqueue(new Uint8Array([73, 68, 51])); } }), { status: 200 })) as unknown as typeof fetch;
+  try {
+    const work = synthesize("A concise summary.", "abort-trace", { apiKey: "test-key", voiceId: "test-voice", dataDir, tracer, trace: parent.context, jobId: "job-a" }, fixtureFetch, controller.signal);
+    await Bun.sleep(10);
+    controller.abort();
+    await expect(work).rejects.toThrow("cancelled");
+    await parent.end("cancelled");
+    await tracer.flush();
+    const records = (await readFile(join(dataDir, "traces", "calls.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(records.find((record) => record.operation === "speech.provider")).toMatchObject({ traceId: "trace-a", parentSpanId: parent.context.spanId, jobId: "job-a", outcome: "cancelled" });
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

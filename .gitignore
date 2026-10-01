@@ -4,5 +4,6 @@ public/assets/
 .env
 /tmp/
 /data/
+native/*.node
 .agents/worktrees/
 /.agents/worktrees/

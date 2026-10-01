@@ -1,4 +1,4 @@
-type Announcement = { key: string };
+type Announcement = { key: string; trace?: { traceId: string; spanId: string } };
 type Owner = { controller: AbortController; audio?: HTMLAudioElement };
 
 export type PrototypePlaybackOwner = {
@@ -58,7 +58,8 @@ export function createPrototypePlaybackOwner({
           return;
         }
 
-        const audio = new Audio(`/api/prototype/audio/${announcement.key}`);
+        const trace = announcement.trace ? `?traceparent=${encodeURIComponent(`00-${announcement.trace.traceId}-${announcement.trace.spanId}-01`)}` : "";
+        const audio = new Audio(`/api/prototype/audio/${announcement.key}${trace}`);
         if (disposed || current !== owner) {
           audio.pause();
           return;

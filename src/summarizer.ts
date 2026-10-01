@@ -2,9 +2,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Logger } from "./logging";
+import type { TraceContext } from "./shared";
+import type { Tracer } from "./tracing";
 
 export interface Summary { speak: boolean; kind: "progress" | "completed" | "blocked" | "error"; text: string; evidenceEventIds: string[]; }
-export interface SummaryInput { text: string; evidenceEventIds: string[]; previousSummary?: string; }
+export interface SummaryInput { text: string; evidenceEventIds: string[]; previousSummary?: string; retry?: number; }
 export type SummaryBackend = "codex" | "claude";
 
 const schema = { type: "object", additionalProperties: false, required: ["speak", "kind", "text", "evidenceEventIds"], properties: { speak: { type: "boolean" }, kind: { type: "string", enum: ["progress", "completed", "blocked", "error"] }, text: { type: "string" }, evidenceEventIds: { type: "array", items: { type: "string" } } } };
@@ -58,14 +60,19 @@ export function validateSummary(value: unknown, knownEvidence: string[]): Summar
   return { speak: result.speak, kind: result.kind as Summary["kind"], text: result.text.trim(), evidenceEventIds: result.evidenceEventIds };
 }
 
-export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_BACKEND ?? "codex") as SummaryBackend, model = Bun.env.SUMMARY_MODEL ?? "", signal?: AbortSignal, logger?: Logger): Promise<Summary> {
+export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_BACKEND ?? "codex") as SummaryBackend, model = Bun.env.SUMMARY_MODEL ?? "", signal?: AbortSignal, logger?: Logger, tracer?: Tracer, trace?: TraceContext): Promise<Summary> {
   const operationId = input.evidenceEventIds.join(",");
+  const summarySpan = tracer?.start("summary.process", { ...trace, jobId: operationId, retry: input.retry });
   if (backend === "codex") {
     await logger?.log("error", { operation: "summary.process", message: "Summary backend is unavailable", outcome: "rejected", metadata: { operationId, backend } });
+    await summarySpan?.end("rejected");
     throw new Error("Codex summary backend is incompatible: this installed CLI cannot provide an empty built-in tool registry");
   }
-  const timeoutMs = positiveSetting("SUMMARY_TIMEOUT_MS", 30_000);
-  const runtime = await mkdtemp(join(tmpdir(), "speak-now-summary-"));
+  let timeoutMs: number;
+  try { timeoutMs = positiveSetting("SUMMARY_TIMEOUT_MS", 30_000); } catch (error) { await summarySpan?.end("rejected"); throw error; }
+  if (signal?.aborted) { await summarySpan?.end("cancelled"); throw abortError(); }
+  let runtime: string;
+  try { runtime = await mkdtemp(join(tmpdir(), "speak-now-summary-")); } catch (error) { await summarySpan?.end("failed"); throw error; }
   try {
     if (signal?.aborted) throw abortError();
       await logger?.log("info", { operation: "summary.process", message: "Started isolated summary process", outcome: "started", metadata: { operationId, backend, model: model || undefined } });
@@ -74,7 +81,8 @@ export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_
     await writeFile(schemaPath, JSON.stringify(schema));
     const args = ["-p", "--safe-mode", "--restricted", "--tools", "", "--disallowedTools", "*", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--setting-sources", "", "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--settings", "{\"disableAllHooks\":true}", "--no-session-persistence", "--output-format", "stream-json", "--verbose", ...(model ? ["--model", model] : [])];
     const env = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", TMPDIR: runtime, NO_COLOR: "1", ...(process.env.USER ? { USER: process.env.USER } : {}), ...(process.env.CLAUDE_CONFIG_DIR ? { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } : {}) };
-    const child = Bun.spawn(["claude", ...args], {
+    const cliSpan = tracer?.start("summary.cli", { ...summarySpan?.context, jobId: operationId, retry: input.retry });
+    const spawnChild = () => Bun.spawn(["claude", ...args], {
       cwd: runtime,
       stdin: "pipe",
       stdout: "pipe",
@@ -82,6 +90,8 @@ export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_
       env,
       detached: true,
     });
+    let child: ReturnType<typeof spawnChild>;
+    try { child = spawnChild(); } catch (error) { await cliSpan?.end("failed"); await summarySpan?.end("failed"); throw error; }
     const controller = new AbortController();
     let stopReason: "cancelled" | "deadline" | "output" | undefined;
     let hardKill: ReturnType<typeof setTimeout> | undefined;
@@ -122,11 +132,16 @@ export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_
       if (stopReason === "deadline") throw new Error(`${backend} summary process timed out`);
       if (stopReason === "output") throw new Error("summary process output exceeded its limit");
       if (child.exitCode !== 0) throw new Error(`${backend} summary process failed with exit ${child.exitCode}: ${sanitizeProviderError(stderr || stdout)}`);
-        const summary = validateSummary(claudeStructuredOutput(stdout), input.evidenceEventIds);
-        await logger?.log("info", { operation: "summary.process", message: "Completed isolated summary process", outcome: "succeeded", metadata: { operationId, kind: summary.kind } });
-        return summary;
-      } catch (error) {
-        await logger?.log("error", { operation: "summary.process", message: "Isolated summary process failed", outcome: "failed", metadata: { operationId, error: error instanceof Error ? error.message : "unknown" } });
+          const summary = validateSummary(claudeStructuredOutput(stdout), input.evidenceEventIds);
+          await logger?.log("info", { operation: "summary.process", message: "Completed isolated summary process", outcome: "succeeded", metadata: { operationId, kind: summary.kind } });
+          await cliSpan?.end("succeeded", { metadata: { exitCode: child.exitCode } });
+          await summarySpan?.end("succeeded", { metadata: { kind: summary.kind } });
+          return summary;
+        } catch (error) {
+          await logger?.log("error", { operation: "summary.process", message: "Isolated summary process failed", outcome: "failed", metadata: { operationId, error: error instanceof Error ? error.message : "unknown" } });
+          const outcome = stopReason === "deadline" ? "timed_out" : stopReason === "cancelled" ? "cancelled" : "failed";
+          await cliSpan?.end(outcome);
+          await summarySpan?.end(outcome);
         throw error;
       } finally {
       clearTimeout(deadline);
@@ -137,6 +152,9 @@ export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_
       await child.exited;
       if (hardKill) clearTimeout(hardKill);
     }
+  } catch (error) {
+    await summarySpan?.end(signal?.aborted ? "cancelled" : "failed");
+    throw error;
   } finally {
     await rm(runtime, { recursive: true, force: true });
   }

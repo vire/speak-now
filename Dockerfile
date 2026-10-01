@@ -1,5 +1,7 @@
 FROM oven/bun:1 AS build
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libnode-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 COPY . .
@@ -12,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/src ./src
+COPY --from=build /app/native ./native
 COPY --from=build /app/public ./public
 EXPOSE 3000
 USER bun

@@ -53,6 +53,8 @@ bun run build
 bun run start
 ```
 
+Trace recording also builds a small local Node-API `flock` guard. `bun run build` discovers headers from a standard local Node installation, or accepts `NODE_API_INCLUDE` when headers live elsewhere. The Docker build installs Linux headers and compiles the matching runtime module. The guard supports macOS and Linux only; network filesystems and other platforms are not claimed.
+
 ## Docker
 
 ```sh
