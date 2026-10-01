@@ -5,6 +5,7 @@ import { captureStructured, captureTerminal, participantIdentity, reconcileTopol
 import type { Activity, Cursor, Participant, Topology } from "./shared";
 import { summarize } from "./summarizer";
 import { synthesize } from "./speech";
+import { collectorLogger } from "./logging";
 
 export interface CollectorConfig {
   sourceNamespace: string;
@@ -342,6 +343,7 @@ async function captureTerminalFallback(participant: Participant, state: Collecto
 }
 
 async function processPending(config: CollectorConfig, state: CollectorState, signal?: AbortSignal): Promise<string | undefined> {
+  const logger = collectorLogger({ dataDirectory: config.dataDir });
   let clip: string | undefined;
   for (const job of state.jobs.filter((item) => !item.done && item.attempts < 2)) {
     if (signal?.aborted) break;
@@ -358,11 +360,11 @@ async function processPending(config: CollectorConfig, state: CollectorState, si
       const summary = await summarize({
         evidenceEventIds,
         text: formatEvidence(job.activity),
-      }, undefined, undefined, signal);
+        }, undefined, undefined, signal, logger);
       if (signal?.aborted) break;
       if (!summary.speak) { job.done = true; job.error = undefined; continue; }
       const key = digest(`${summary.text}\0${Bun.env.ELEVENLABS_VOICE_ID}\0eleven_flash_v2_5`);
-      const generated = await synthesize(summary.text, key, { apiKey: Bun.env.ELEVENLABS_API_KEY, voiceId: Bun.env.ELEVENLABS_VOICE_ID, dataDir: config.dataDir }, fetch, signal);
+      const generated = await synthesize(summary.text, key, { apiKey: Bun.env.ELEVENLABS_API_KEY, voiceId: Bun.env.ELEVENLABS_VOICE_ID, dataDir: config.dataDir, logger, operationId: job.activity.id, jobId: job.activity.id }, fetch, signal);
       if (signal?.aborted) break;
       const temporary = join(config.dataDir, `latest-announcement.${crypto.randomUUID()}.tmp`);
       const publishedKey = generated.path.split("/").at(-1)?.replace(/\.mp3$/, "");
@@ -371,9 +373,11 @@ async function processPending(config: CollectorConfig, state: CollectorState, si
       job.done = true;
       job.error = undefined;
       clip = generated.path;
+      await logger.log("info", { operation: "collector.job", message: "Completed announcement job", outcome: "succeeded", participantId: job.activity.participantId, jobId: job.activity.id, metadata: { operationId: job.activity.id, clip: publishedKey } });
     } catch (error) {
       job.error = error instanceof Error ? error.message : "summary or speech failure";
       if (job.attempts >= 2) job.done = true;
+      await logger.log("error", { operation: "collector.job", message: "Announcement job failed", outcome: "failed", participantId: job.activity.participantId, jobId: job.activity.id, metadata: { operationId: job.activity.id, error: job.error } });
     }
     await persist(config.dataDir, state);
   }
@@ -398,6 +402,7 @@ function enqueueActivity(state: CollectorState, activity: Activity, accepted: Ac
 }
 
 export async function runOnce(config: CollectorConfig, state: CollectorState, signal?: AbortSignal): Promise<{ activities: Activity[]; clip?: string }> {
+  const logger = collectorLogger({ dataDirectory: config.dataDir });
   throwIfAborted(signal);
   let observed: Topology;
   try {
@@ -421,6 +426,7 @@ export async function runOnce(config: CollectorConfig, state: CollectorState, si
       const activities = participant.sessionId
         ? await captureParticipant(participant, staged, signal)
         : await captureTerminalFallback(participant, staged, signal);
+      for (const activity of activities) await logger.log(activity.status === "gap" ? "warn" : "info", { operation: activity.captureMode === "structured" ? "capture.transcript" : "capture.terminal", message: "Captured observation activity", outcome: activity.status, participantId: participant.id, sourceId: config.sourceNamespace, metadata: { operationId: activity.id, sourceCursor: activity.sourceCursor, originalTextBytes: activity.originalTextBytes } });
       const admitted: Activity[] = [];
       for (const activity of activities) {
         if (!canEnqueue(next, [...admitted, activity])) break;
@@ -447,6 +453,7 @@ export async function runOnce(config: CollectorConfig, state: CollectorState, si
       }
     } catch (error) {
       addStatus(next, participant.id, participant.sessionId ? "unavailable" : "limited", error instanceof Error ? error.message.slice(0, 240) : "Source observation failed");
+      await logger.log("error", { operation: "capture.observe", message: "Capture observation failed", outcome: "failed", participantId: participant.id, sourceId: config.sourceNamespace, metadata: { error: error instanceof Error ? error.message : "unknown" } });
     }
   }
   throwIfAborted(signal);
@@ -457,6 +464,7 @@ export async function runOnce(config: CollectorConfig, state: CollectorState, si
   state.jobs = state.jobs.map((job) => job.done ? { ...job, activity: { ...job.activity, text: "" } } : job).slice(-MAX_PENDING_JOBS);
   if (state.activityIds.size > MAX_PENDING_JOBS * 4) state.activityIds = new Set([...state.activityIds].slice(-MAX_PENDING_JOBS * 4));
   await persist(config.dataDir, state);
+  await logger.flush();
   return { activities: accepted, clip };
 }
 
@@ -482,5 +490,6 @@ if (import.meta.main) {
   const controller = new AbortController();
   process.once("SIGINT", () => controller.abort());
   process.once("SIGTERM", () => controller.abort());
-  void watch({ sourceNamespace: Bun.env.SOURCE_NAMESPACE ?? "local", dataDir: Bun.env.SPEAK_NOW_DATA_DIR ?? "data", pollMs: Number(Bun.env.POLL_MS ?? 1_000), excludePaneIds: (Bun.env.OBSERVATION_EXCLUDE_PANES ?? process.env.HERDR_PANE_ID ?? "").split(",").filter(Boolean) }, controller.signal);
+  const config = { sourceNamespace: Bun.env.SOURCE_NAMESPACE ?? "local", dataDir: Bun.env.SPEAK_NOW_DATA_DIR ?? "data", pollMs: Number(Bun.env.POLL_MS ?? 1_000), excludePaneIds: (Bun.env.OBSERVATION_EXCLUDE_PANES ?? process.env.HERDR_PANE_ID ?? "").split(",").filter(Boolean) };
+  void watch(config, controller.signal).finally(() => collectorLogger({ dataDirectory: config.dataDir }).flush());
 }
