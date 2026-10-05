@@ -4,8 +4,9 @@ import { join } from "node:path";
 import type { Logger } from "./logging";
 import type { TraceContext } from "./shared";
 import type { Tracer } from "./tracing";
+import type { ErrorReporter } from "./errors";
 
-export interface SpeechConfig { apiKey?: string; voiceId?: string; dataDir: string; model?: string; timeoutMs?: number; logger?: Logger; tracer?: Tracer; trace?: TraceContext; operationId?: string; jobId?: string; }
+export interface SpeechConfig { apiKey?: string; voiceId?: string; dataDir: string; model?: string; timeoutMs?: number; logger?: Logger; tracer?: Tracer; reporter?: ErrorReporter; trace?: TraceContext; operationId?: string; jobId?: string; }
 export interface Clip { path: string; cached: boolean; }
 const pending = new Map<string, Promise<Clip>>();
 const audioLimit = 20_000_000;
@@ -49,10 +50,13 @@ async function readAudio(body: ReadableStream<Uint8Array>, signal: AbortSignal):
 export async function synthesize(text: string, key: string, config: SpeechConfig, fetcher: typeof fetch = fetch, signal?: AbortSignal): Promise<Clip> {
   const log = config.logger;
   const fields = { operationId: config.operationId, jobId: config.jobId, clipKey: key };
+  if (signal?.aborted) { await config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId }).end("cancelled"); throw cancellationError(); }
   if (!config.apiKey || !config.voiceId) {
     await config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId }).end("rejected");
     await log?.log("error", { operation: "speech.synthesize", message: "Speech configuration is unavailable", outcome: "rejected", jobId: config.jobId, metadata: fields });
-    throw new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required for live speech");
+    const error = new Error("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required for live speech");
+    await config.reporter?.report({ service: "collector", operation: "speech.synthesize", category: "provider", error, trace: config.trace, context: fields });
+    throw error;
   }
   const timeoutMs = positiveTimeout(config.timeoutMs);
   const apiKey = config.apiKey;
@@ -99,6 +103,7 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
         await mediaSpan?.end(controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
         await providerSpan?.end(timedOut ? "timed_out" : controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
         await log?.log("error", { operation: "speech.synthesize", message: "Speech request failed", outcome: "failed", jobId: config.jobId, metadata: { ...fields, error: error instanceof Error ? error.message : "unknown" } });
+        if (timedOut || (!controller.signal.aborted && !signal?.aborted)) await config.reporter?.report({ service: "collector", operation: "speech.synthesize", category: timedOut ? "timeout" : "provider", error, trace: providerSpan?.context ?? config.trace, context: fields });
         throw error;
     } finally {
       clearTimeout(deadline);
