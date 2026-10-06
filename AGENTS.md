@@ -29,6 +29,13 @@ Speak Now uses Bun, TypeScript, and React to turn existing Herdr agent updates i
 - Never commit implementation plans, task plans, handoffs, or local review/evidence files. Keep them in ignored `tmp/` or the shared taskboard; put reviewer-facing scope and validation in the PR description.
 - Before committing, inspect the staged file list and unstage any plan or local coordination artifact.
 
+## Effect
+
+- Use Effect for recoverable errors, resource acquisition and cleanup, concurrency, cancellation, timeouts, and retry policies in new or changed backend workflows. Represent expected failures with typed errors and handle them through Effect operators.
+- Never fall back to handwritten error handling, error-message matching, manual Promise orchestration, or custom lifecycle machinery for concerns Effect supports. Keep Effect as a production dependency; performance concerns call for improving the Effect implementation, not replacing it with a native fallback.
+- Wrap unavoidable native APIs in narrow Effect adapters. Lift failures with `Effect.try` or `Effect.tryPromise`, own resources with `Effect.acquireRelease` and `Effect.scoped`, and keep native cancellation and process reaping explicit inside those adapters.
+- Run Effects at application boundaries and preserve existing public contracts, including Promise interfaces. Keep one terminal reporting owner, safe typed diagnostics, and the existing retry budget; cancellation must not become a reported failure.
+
 ## Behavior changes
 
 - **Spec -> test -> code, in that order. Always.** Every behavior change follows the triad:
