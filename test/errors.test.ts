@@ -58,6 +58,13 @@ test("keeps reporting failure bounded and visible", async () => {
     await reporter.flush();
     expect(reporter.getStatus()).toMatchObject({ destinationAvailable: false, pendingEntries: 0 });
     expect(reporter.getStatus().lastFailure).not.toContain("synthetic-secret");
+    await rm(blocked);
+    await reporter.report({ service: "app", operation: "recovered", category: "fixture", error: new Error("safe") });
+    await reporter.flush();
+    expect(reporter.getStatus().destinationAvailable).toBe(true);
+    const reports = (await readFile(join(blocked, "errors", "reports.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(reports).toHaveLength(1);
+    expect(reports[0].operation).toBe("recovered");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

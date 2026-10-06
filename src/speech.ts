@@ -58,26 +58,32 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
     await config.reporter?.report({ service: "collector", operation: "speech.synthesize", category: "provider", error, trace: config.trace, context: fields });
     throw error;
   }
-  const timeoutMs = positiveTimeout(config.timeoutMs);
+  let timeoutMs: number;
+    try { timeoutMs = positiveTimeout(config.timeoutMs); } catch (error) {
+      await config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId ?? config.trace?.jobId }).end("rejected");
+      await config.reporter?.report({ service: "collector", operation: "speech.synthesize", category: "provider", error, trace: config.trace, context: fields });
+      throw error;
+    }
   const apiKey = config.apiKey;
   const voiceId = config.voiceId;
   const directory = join(config.dataDir, "audio");
   const cacheKey = createHash("sha256").update(`${key}\0${voiceId}\0${config.model ?? "eleven_flash_v2_5"}`).digest("hex");
   const path = join(directory, `${cacheKey}.mp3`);
-  if (await Bun.file(path).exists()) { await config.tracer?.start("media.cache", { ...config.trace, jobId: config.jobId, clipId: cacheKey }).end("cached"); await log?.log("info", { operation: "media.cache", message: "Reused cached audio", outcome: "cached", jobId: config.jobId, metadata: fields }); return { path, cached: true }; }
+  if (await Bun.file(path).exists()) { await config.tracer?.start("media.cache", { ...config.trace, jobId: config.jobId ?? config.trace?.jobId, clipId: cacheKey }).end("cached"); await log?.log("info", { operation: "media.cache", message: "Reused cached audio", outcome: "cached", jobId: config.jobId, metadata: fields }); return { path, cached: true }; }
   const existing = pending.get(cacheKey);
   if (existing) return existing;
   const work = (async () => {
-    await mkdir(directory, { recursive: true });
     const temporary = `${path}.${crypto.randomUUID()}.tmp`;
     const controller = new AbortController();
     const cancel = () => controller.abort();
     signal?.addEventListener("abort", cancel, { once: true });
     let timedOut = false;
     const deadline = setTimeout(() => { timedOut = true; cancel(); }, timeoutMs);
-      const providerSpan = config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId, clipId: cacheKey });
+      const providerSpan = config.tracer?.start("speech.provider", { ...config.trace, jobId: config.jobId ?? config.trace?.jobId, clipId: cacheKey });
       let mediaSpan: ReturnType<NonNullable<typeof config.tracer>["start"]> | undefined;
       try {
+        if (signal?.aborted) throw cancellationError();
+        await mkdir(directory, { recursive: true });
         await log?.log("info", { operation: "speech.synthesize", message: "Started speech request", outcome: "started", jobId: config.jobId, metadata: fields });
       if (signal?.aborted) throw cancellationError();
       const response = await fetcher(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
@@ -91,7 +97,7 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
       if (!response.body) throw new Error("ElevenLabs returned no audio body");
       const audio = await readAudio(response.body, controller.signal);
       await providerSpan?.end("succeeded", { metadata: { status: response.status } });
-      mediaSpan = config.tracer?.start("media.write", { ...providerSpan?.context, jobId: config.jobId, clipId: cacheKey });
+      mediaSpan = config.tracer?.start("media.write", { ...providerSpan?.context, jobId: config.jobId ?? config.trace?.jobId, clipId: cacheKey });
       await writeFile(temporary, audio);
       if (controller.signal.aborted) throw cancellationError();
         await rename(temporary, path);
@@ -99,7 +105,9 @@ export async function synthesize(text: string, key: string, config: SpeechConfig
         await log?.log("info", { operation: "media.write", message: "Published audio clip", outcome: "succeeded", jobId: config.jobId, metadata: fields });
         return { path, cached: false };
       } catch (error) {
-        await rm(temporary, { force: true });
+        try { await rm(temporary, { force: true }); } catch {
+          await log?.log("warn", { operation: "media.cleanup", message: "Could not remove temporary audio clip", outcome: "failed", jobId: config.jobId });
+        }
         await mediaSpan?.end(controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
         await providerSpan?.end(timedOut ? "timed_out" : controller.signal.aborted || signal?.aborted ? "cancelled" : "failed");
         await log?.log("error", { operation: "speech.synthesize", message: "Speech request failed", outcome: "failed", jobId: config.jobId, metadata: { ...fields, error: error instanceof Error ? error.message : "unknown" } });

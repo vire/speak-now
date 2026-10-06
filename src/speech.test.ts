@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { synthesize } from "./speech";
@@ -80,3 +80,36 @@ test("reports a synthetic provider failure without a network call", async () => 
     expect(report).toMatchObject({ service: "collector", operation: "speech.synthesize", category: "provider", traceId: "a".repeat(32), jobId: "job-a" });
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
+
+for (const failure of ["mkdir", "timeout", "cleanup"] as const) {
+  test(`reports speech ${failure} failure without losing its primary error`, async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "speak-now-speech-owner-"));
+    const reporter = createErrorReporter({ dataDirectory: dataDir });
+    let calls = 0;
+    const primary = new Error("primary provider failure");
+    const fixtureFetch = (async () => {
+      calls += 1;
+      if (failure === "cleanup") {
+        const audio = join(dataDir, "audio");
+        await mkdir(audio, { recursive: true });
+        // The provider can race output setup: replace audio with a regular file.
+        await rm(audio, { recursive: true });
+        await writeFile(audio, "blocked");
+      }
+      throw primary;
+    }) as unknown as typeof fetch;
+    try {
+      if (failure === "mkdir") await writeFile(join(dataDir, "audio"), "blocked");
+      const work = synthesize("safe", "owner", { apiKey: "test-key", voiceId: "test-voice", dataDir, reporter, timeoutMs: failure === "timeout" ? 0 : undefined, trace: { traceId: "a".repeat(32), spanId: "b".repeat(16), sourceId: "source-a", jobId: "job-a" } }, fixtureFetch);
+      if (failure === "cleanup") await expect(work).rejects.toBe(primary);
+      else await expect(work).rejects.toThrow();
+      await reporter.flush();
+      const file = Bun.file(join(dataDir, "errors", "reports.jsonl"));
+      expect(await file.exists()).toBe(true);
+      const reports = (await file.text()).trim().split("\n").map((line) => JSON.parse(line));
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ operation: "speech.synthesize", traceId: "a".repeat(32), sourceId: "source-a", jobId: "job-a" });
+      expect(calls).toBe(failure === "cleanup" ? 1 : 0);
+    } finally { await rm(dataDir, { recursive: true, force: true }); }
+  });
+}
