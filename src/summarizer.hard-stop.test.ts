@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-type StopCase = "deadline" | "caller-cancel" | "output-limit";
+type StopCase = "deadline" | "caller-cancel" | "output-limit" | "descendant";
 
 async function killOwnedWorker(pidFile: string): Promise<void> {
   let pid: number;
@@ -34,17 +34,25 @@ async function runUncooperativeWorker(kind: StopCase) {
   try {
     await Promise.all([mkdir(bin), mkdir(runtimes)]);
     const flood = kind === "output-limit" ? "printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2" : ":";
-    await writeFile(join(bin, "claude"), `#!/bin/sh
+    const body = kind === "descendant" ? `#!/bin/sh
+sh -c 'echo $$ > ${join(root, "descendant.pid")}; trap "touch ${terminated}" TERM; while :; do :; done' &
+echo $$ > ${workerPid}
+touch ${started}
+exit 0
+` : `#!/bin/sh
 echo $$ > ${workerPid}
 touch ${started}
 trap 'touch ${terminated}' TERM
 while :; do ${flood}; done
-`);
+`;
+    await writeFile(join(bin, "claude"), body);
     await chmod(join(bin, "claude"), 0o755);
     const runner = `
 import { summarize } from ${JSON.stringify(join(process.cwd(), "src/summarizer.ts"))};
+import { createErrorReporter } from ${JSON.stringify(join(process.cwd(), "src/errors.ts"))};
+const reporter = createErrorReporter({ dataDirectory: ${JSON.stringify(root)} });
 const controller = new AbortController();
-const work = summarize({ text: "evidence", evidenceEventIds: ["event-a"] }, "claude", "fixture", controller.signal);
+const work = summarize({ text: "evidence", evidenceEventIds: ["event-a"] }, "claude", "fixture", controller.signal, undefined, undefined, undefined, reporter);
 if (${JSON.stringify(kind)} === "caller-cancel") {
   while (!(await Bun.file(${JSON.stringify(started)}).exists())) await Bun.sleep(5);
   controller.abort();
@@ -54,6 +62,7 @@ try {
 } catch (error) {
   console.log(error instanceof Error ? error.message : "unknown");
 }
+await reporter.flush();
 `;
     const startedAt = Date.now();
     const child = Bun.spawn([Bun.which("bun")!, "-e", runner], {
@@ -66,7 +75,7 @@ try {
         HOME: root,
         TMPDIR: runtimes,
         USER: "fixture-user",
-        SUMMARY_TIMEOUT_MS: kind === "deadline" ? "1000" : "30000",
+        SUMMARY_TIMEOUT_MS: kind === "deadline" || kind === "descendant" ? "1000" : "30000",
       },
     });
     let cleanup: Promise<void> | undefined;
@@ -80,10 +89,13 @@ try {
     try {
       const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
       await child.exited;
-      return { root, elapsedMs: Date.now() - startedAt, exitCode: child.exitCode, stdout, stderr, started, terminated, runtimes, workerPid };
+      const reportsFile = Bun.file(join(root, "errors", "reports.jsonl"));
+      const reports = await reportsFile.exists() ? (await reportsFile.text()).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+      return { reports, root, elapsedMs: Date.now() - startedAt, exitCode: child.exitCode, stdout, stderr, started, terminated, runtimes, workerPid };
     } finally {
       clearTimeout(guard);
       await stopFixture();
+      await killOwnedWorker(join(root, "descendant.pid"));
     }
   } catch (error) {
     await rm(root, { recursive: true, force: true });
@@ -93,16 +105,18 @@ try {
 
 // Contract: every stop source escalates an owned TERM-ignoring worker to SIGKILL,
 // reaps it, and cleans its private runtime before the caller returns.
-for (const kind of ["deadline", "caller-cancel", "output-limit"] as const) {
+for (const kind of ["deadline", "caller-cancel", "output-limit", "descendant"] as const) {
   test(`hard-stops and reaps an uncooperative worker after ${kind}`, async () => {
     const result = await runUncooperativeWorker(kind);
     try {
       expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.reports).toHaveLength(kind === "caller-cancel" ? 0 : 1);
+      if (kind !== "caller-cancel") expect(result.reports[0].category).toBe(kind === "output-limit" ? "subprocess" : "timeout");
       expect(result.elapsedMs).toBeLessThan(2_000);
       expect(await Bun.file(result.started).exists()).toBe(true);
       expect(await Bun.file(result.terminated).exists()).toBe(true);
       expect(await readdir(result.runtimes)).toEqual([]);
-      expect(result.stdout).toContain(kind === "deadline" ? "timed out" : kind === "caller-cancel" ? "cancelled" : "output exceeded its limit");
+      expect(result.stdout).toContain(kind === "deadline" || kind === "descendant" ? "timed out" : kind === "caller-cancel" ? "cancelled" : "output exceeded its limit");
     } finally {
       await rm(result.root, { recursive: true, force: true });
     }
