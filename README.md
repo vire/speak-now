@@ -39,7 +39,8 @@ Open the app and select **Enable audio** once to grant browser playback permissi
 | --- | --- |
 | `GET /api/health` | `{ "status": "ok" }` |
 | `GET /api/hello` | `{ "message": "Hello from Speak Now!" }` |
-| `GET /api/config` | Local collector command and live speech configuration status |
+| `GET /api/config` | Local collector command, live speech configuration, and diagnostic/report destination status |
+| `POST /api/client-errors` | Same-origin JSON error report, returning `{ "reportId": "..." }` with status 202 |
 | `GET /api/prototype/latest` | The latest completed local announcement, if any |
 | `GET /api/prototype/audio/:key` | A completed local MP3 for a validated clip key |
 
@@ -61,3 +62,11 @@ Trace files are local JSONL files under `data/traces/writer-*/`. Each process ow
 docker build -t speak-now .
 docker run --rm -p 3000:3000 speak-now
 ```
+
+## Local error reports
+
+Collector capture, summary worker, speech provider, and announcement publication failures produce redacted JSONL reports in `data/errors/reports.jsonl`. Records include a report ID, UTC timestamp, operation/category, bounded message/stack, and available trace/source/job identifiers. Expected caller cancellation does not create a report. Reports reuse diagnostic rotation and retention, with a default 1 MiB per file and seven-day row retention. Local reporter processes serialize writes with an exclusive destination lock; distributed filesystems and automatic recovery of an orphaned lock are outside this contract.
+
+`POST /api/client-errors` accepts same-origin `application/json` requests up to 8 KiB. Required nonempty strings are `operation` (120 characters), `category` (80), and `message` (1,024). Optional fields are `stack` (2,048), source/participant/job IDs (128 each), a complete hexadecimal trace/span pair (32/16), and a flat `context` object. Stored context is limited to scalar `activityId`, `attempt`, `backend`, `captureMode`, `clipKey`, `operationId`, `originalTextBytes`, `retry`, and `status` values, with strings bounded to 128 characters. Arbitrary payloads and nested context are omitted. Browser event wiring is reserved for the later UI task.
+
+Oversized streamed requests receive 413 before body completion, with the connection closed and no report created. A failed report destination uses bounded redacted stderr diagnostics and exposes its status through `/api/config`; reporting failure does not recursively report itself. Repairing the destination permits subsequent writes to restore available status.

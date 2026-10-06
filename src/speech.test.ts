@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { synthesize } from "./speech";
 import { createTracer } from "./tracing";
+import { createErrorReporter } from "./errors";
 
 test("writes and reuses the deterministic ElevenLabs provider-contract fixture", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "speak-now-speech-test-"));
@@ -66,4 +67,16 @@ test("traces a cancelled provider request", async () => {
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("reports a synthetic provider failure without a network call", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-speech-error-"));
+  const reporter = createErrorReporter({ dataDirectory: dataDir });
+  const fixtureFetch = (async () => new Response("unavailable", { status: 503 })) as unknown as typeof fetch;
+  try {
+    await expect(synthesize("A concise summary.", "provider-error", { apiKey: "test-key", voiceId: "test-voice", dataDir, reporter, trace: { traceId: "a".repeat(32), spanId: "b".repeat(16), jobId: "job-a" } }, fixtureFetch)).rejects.toThrow("503");
+    await reporter.flush();
+    const [report] = (await readFile(join(dataDir, "errors", "reports.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(report).toMatchObject({ service: "collector", operation: "speech.synthesize", category: "provider", traceId: "a".repeat(32), jobId: "job-a" });
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
 });

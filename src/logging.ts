@@ -1,18 +1,18 @@
-import { mkdir, open, readdir, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogService = "app" | "collector";
-export interface LogFields { operation: string; message: string; sourceId?: string; participantId?: string; jobId?: string; outcome?: string; metadata?: Record<string, unknown>; }
-export interface LoggerOptions { service: LogService; dataDirectory?: string; minimumLevel?: LogLevel; maxFileBytes?: number; maxMetadataBytes?: number; maxRecordBytes?: number; maxQueueEntries?: number; maxRetainedFiles?: number; retentionDays?: number; }
+export interface LogFields { operation: string; message: string; sourceId?: string; participantId?: string; jobId?: string; outcome?: string; metadata?: Record<string, unknown>; reportId?: string; reportService?: LogService; category?: string; stack?: string; traceId?: string; spanId?: string; }
+export interface LoggerOptions { service: LogService; dataDirectory?: string; directory?: string; filename?: string; serializeAcrossProcesses?: boolean; minimumLevel?: LogLevel; maxFileBytes?: number; maxMetadataBytes?: number; maxRecordBytes?: number; maxQueueEntries?: number; maxRetainedFiles?: number; retentionDays?: number; }
 export interface LoggerStatus { destinationAvailable: boolean; pendingEntries: number; droppedEntries: number; lastFailure?: string; lastFailureAt?: string; }
 export interface Logger { log(level: LogLevel, fields: LogFields): Promise<void>; flush(): Promise<void>; getStatus(): LoggerStatus; }
 interface SinkConfig { maxFileBytes: number; maxMetadataBytes: number; maxRecordBytes: number; maxQueueEntries: number; maxRetainedFiles: number; retentionMs: number; }
-interface Sink { config: SinkConfig; directory: string; filename: string; path: string; service: LogService; tail: Promise<void>; pendingEntries: number; droppedEntries: number; destinationAvailable: boolean; lastFailure?: string; lastFailureAt?: string; lastFallbackAt: number; prepared: boolean; rotationSequence: number; activeStartedAt?: number; }
+interface Sink { config: SinkConfig; directory: string; filename: string; path: string; service: LogService; serializeAcrossProcesses: boolean; tail: Promise<void>; pendingEntries: number; droppedEntries: number; destinationAvailable: boolean; lastFailure?: string; lastFailureAt?: string; lastFallbackAt: number; prepared: boolean; rotationSequence: number; activeStartedAt?: number; }
 
 const levelRank: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 const secretKey = /authorization|token|secret|password|api[-_]?key|credential|cookie|session/i;
-const routineOutputKey = /prompt|transcript|source.?output|captured.?output|raw.?output/i;
+const routineOutputKey = /prompt|transcript|source.?output|captured.?output|raw.?output|stdout|stderr|header|body/i;
 const sinks = new Map<string, Sink>();
 const fallbackStreams = new WeakSet<object>();
 const maxDepth = 4;
@@ -100,13 +100,18 @@ function sanitize(value: unknown, budget: number, depth = 0): unknown {
 
 function encodeRecord(service: LogService, level: LogLevel, fields: LogFields, config: SinkConfig): string | undefined {
   const metadata = sanitize(fields.metadata ?? {}, config.maxMetadataBytes);
-  const record: Record<string, unknown> = { timestamp: new Date().toISOString(), level, service, operation: redactText(boundedText(fields.operation, 120)), message: redactText(boundedText(fields.message, 1_024)) };
+  const record: Record<string, unknown> = { timestamp: new Date().toISOString(), level, service: fields.reportService ?? service, operation: redactText(boundedText(fields.operation, 120)), message: redactText(boundedText(fields.message, 1_024)) };
   if (fields.sourceId) record.sourceId = redactText(boundedText(fields.sourceId, 128));
   if (fields.participantId) record.participantId = redactText(boundedText(fields.participantId, 128));
   if (fields.jobId) record.jobId = redactText(boundedText(fields.jobId, 128));
   if (fields.outcome) record.outcome = redactText(boundedText(fields.outcome, 80));
+  if (fields.reportId) record.reportId = redactText(boundedText(fields.reportId, 128));
+  if (fields.category) record.category = redactText(boundedText(fields.category, 80));
+  if (fields.stack) record.stack = redactText(boundedText(fields.stack, 2_048));
+  if (fields.traceId) record.traceId = redactText(boundedText(fields.traceId, 128));
+  if (fields.spanId) record.spanId = redactText(boundedText(fields.spanId, 128));
   if (typeof metadata === "object" && metadata !== null && Object.keys(metadata).length > 0) record.metadata = metadata;
-  const optional = ["metadata", "outcome", "jobId", "participantId", "sourceId"];
+  const optional = ["metadata", "stack", "spanId", "traceId", "outcome", "jobId", "participantId", "sourceId"];
   let line = `${JSON.stringify(record)}\n`;
   for (const key of optional) { if (utf8(line) <= config.maxRecordBytes) break; delete record[key]; line = `${JSON.stringify(record)}\n`; }
   for (const key of ["message", "operation"] as const) while (utf8(line) > config.maxRecordBytes && typeof record[key] === "string" && record[key].length > 0) { record[key] = record[key].slice(0, Math.floor(record[key].length / 2)); line = `${JSON.stringify(record)}\n`; }
@@ -138,7 +143,7 @@ function validLines(text: string, startsAtBoundary: boolean, sink: Sink): string
   let bytes = 0;
   for (const line of lines.reverse()) {
     if (!line || utf8(`${line}\n`) > sink.config.maxRecordBytes) continue;
-    try { JSON.parse(line); } catch { continue; }
+    try { const record = JSON.parse(line) as { timestamp?: string }; if (!Number.isFinite(Date.parse(record.timestamp ?? "")) || Date.parse(record.timestamp ?? "") < Date.now() - sink.config.retentionMs) continue; } catch { continue; }
     if (bytes + utf8(`${line}\n`) > sink.config.maxFileBytes) break;
     retained.unshift(line);
     bytes += utf8(`${line}\n`);
@@ -147,7 +152,9 @@ function validLines(text: string, startsAtBoundary: boolean, sink: Sink): string
 }
 async function reconcileExistingFile(sink: Sink, path: string): Promise<number | undefined> {
   const existing = await stat(path);
-  const { text, startsAtBoundary } = await readTail(path, existing.size);
+  const { text, startsAtBoundary } = existing.size <= sink.config.maxFileBytes
+    ? { text: await readFile(path, "utf8"), startsAtBoundary: true }
+    : await readTail(path, existing.size);
   const lines = validLines(text, startsAtBoundary, sink);
   const repaired = `${lines.join("\n")}${lines.length ? "\n" : ""}`;
   const requiresRepair = existing.size > sink.config.maxFileBytes || !startsAtBoundary || utf8(repaired) !== existing.size;
@@ -167,11 +174,9 @@ async function reconcileExistingFile(sink: Sink, path: string): Promise<number |
   } catch { return existing.mtimeMs; }
 }
 async function maintain(sink: Sink): Promise<void> {
-  const cutoff = Date.now() - sink.config.retentionMs;
-  if (sink.activeStartedAt !== undefined && sink.activeStartedAt < cutoff) {
-    try { await unlink(sink.path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    sink.activeStartedAt = undefined;
-    diagnostic(sink, "expired active log file", false);
+  const entries = await readdir(sink.directory, { withFileTypes: true });
+  for (const entry of entries) if (entry.isFile() && (entry.name === sink.filename || entry.name.startsWith(`${sink.service}.`) && entry.name.endsWith(".jsonl"))) {
+    try { const first = await reconcileExistingFile(sink, join(sink.directory, entry.name)); if (entry.name === sink.filename) sink.activeStartedAt = first; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
   await prune(sink);
 }
@@ -191,6 +196,14 @@ async function prepare(sink: Sink): Promise<void> {
   sink.prepared = true;
 }
 async function append(sink: Sink, line: string): Promise<void> {
+  if (sink.serializeAcrossProcesses) {
+    await mkdir(sink.directory, { recursive: true });
+    const lock = `${sink.path}.lock`;
+    for (;;) {
+      try { const handle = await open(lock, "wx"); try { await handle.close(); sink.serializeAcrossProcesses = false; await append(sink, line); } finally { sink.serializeAcrossProcesses = true; await unlink(lock); } return; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await Bun.sleep(2); }
+    }
+  }
   await prepare(sink);
   await maintain(sink);
   try {
@@ -205,12 +218,12 @@ async function append(sink: Sink, line: string): Promise<void> {
 }
 function getSink(options: LoggerOptions): Sink {
   const config = sinkConfig(options);
-  const directory = resolve(options.dataDirectory ?? "data", "logs");
-  const filename = `${options.service}.jsonl`;
+  const directory = resolve(options.dataDirectory ?? "data", options.directory ?? "logs");
+  const filename = options.filename ?? `${options.service}.jsonl`;
   const path = join(directory, filename);
   const existing = sinks.get(path);
   if (existing) { if (!sameConfig(existing.config, config)) throw new TypeError(`incompatible logger configuration for ${path}`); return existing; }
-  const sink: Sink = { config, directory, filename, path, service: options.service, tail: Promise.resolve(), pendingEntries: 0, droppedEntries: 0, destinationAvailable: true, lastFallbackAt: 0, prepared: false, rotationSequence: 0 };
+  const sink: Sink = { config, directory, filename, path, service: options.service, serializeAcrossProcesses: options.serializeAcrossProcesses ?? false, tail: Promise.resolve(), pendingEntries: 0, droppedEntries: 0, destinationAvailable: true, lastFallbackAt: 0, prepared: false, rotationSequence: 0 };
   sinks.set(path, sink);
   return sink;
 }

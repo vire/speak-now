@@ -7,6 +7,7 @@ import { summarize } from "./summarizer";
 import { synthesize } from "./speech";
 import { collectorLogger } from "./logging";
 import { collectorTracer } from "./tracing";
+import { createErrorReporter } from "./errors";
 
 export interface CollectorConfig {
   sourceNamespace: string;
@@ -183,7 +184,7 @@ export async function readTopology(config: CollectorConfig, signal?: AbortSignal
     const excluded = exclusionPaneIds(config.sourceNamespace, config.excludePaneIds);
     await span.end("succeeded");
     return { ...topology, participants: topology.participants.filter((participant) => !excluded.has(participant.paneId)) };
-  } catch (error) { await span.end(signal?.aborted ? "cancelled" : "failed"); throw error; }
+  } catch (error) { await span.end(signal?.aborted ? "cancelled" : "failed"); throw Object.assign(error instanceof Error ? error : new Error(String(error)), { trace: span.context }); }
 }
 
 async function transcriptPaths(kind: "claude" | "codex", sessionId: string, signal?: AbortSignal, dataDir?: string, fields: Parameters<ReturnType<typeof collectorTracer>["start"]>[1] = {}): Promise<string[]> {
@@ -365,6 +366,7 @@ async function captureTerminalFallback(participant: Participant, state: Collecto
 async function processPending(config: CollectorConfig, state: CollectorState, signal?: AbortSignal): Promise<string | undefined> {
   const logger = collectorLogger({ dataDirectory: config.dataDir });
   const tracer = collectorTracer({ dataDirectory: config.dataDir });
+  const reporter = createErrorReporter({ dataDirectory: config.dataDir });
   let clip: string | undefined;
   for (const job of state.jobs.filter((item) => !item.done && item.attempts < 2)) {
     if (signal?.aborted) break;
@@ -382,16 +384,21 @@ async function processPending(config: CollectorConfig, state: CollectorState, si
           evidenceEventIds,
           text: formatEvidence(job.activity),
           retry: job.attempts - 1,
-          }, undefined, undefined, signal, logger, tracer, job.activity.trace);
+          }, undefined, undefined, signal, logger, tracer, job.activity.trace, reporter);
       if (signal?.aborted) break;
       if (!summary.speak) { job.done = true; job.error = undefined; continue; }
       const key = digest(`${summary.text}\0${Bun.env.ELEVENLABS_VOICE_ID}\0eleven_flash_v2_5`);
-        const generated = await synthesize(summary.text, key, { apiKey: Bun.env.ELEVENLABS_API_KEY, voiceId: Bun.env.ELEVENLABS_VOICE_ID, dataDir: config.dataDir, logger, tracer, trace: job.activity.trace, operationId: job.activity.id, jobId: job.activity.id }, fetch, signal);
+        const generated = await synthesize(summary.text, key, { apiKey: Bun.env.ELEVENLABS_API_KEY, voiceId: Bun.env.ELEVENLABS_VOICE_ID, dataDir: config.dataDir, logger, tracer, reporter, trace: job.activity.trace, operationId: job.activity.id, jobId: job.activity.id }, fetch, signal);
       if (signal?.aborted) break;
       const temporary = join(config.dataDir, `latest-announcement.${crypto.randomUUID()}.tmp`);
       const publishedKey = generated.path.split("/").at(-1)?.replace(/\.mp3$/, "");
+      try {
         await writeFile(temporary, JSON.stringify({ key: publishedKey, text: summary.text, kind: summary.kind, createdAt: new Date().toISOString(), trace: job.activity.trace, announcementId: job.activity.id }));
-      await rename(temporary, join(config.dataDir, "latest-announcement.json"));
+        await rename(temporary, join(config.dataDir, "latest-announcement.json"));
+      } catch (error) {
+        await reporter.report({ service: "collector", operation: "collector.publication", category: "publication", error, trace: job.activity.trace, context: { activityId: job.activity.id, operationId: job.activity.id } });
+        throw error;
+      }
       job.done = true;
       job.error = undefined;
       clip = generated.path;
@@ -426,12 +433,13 @@ function enqueueActivity(state: CollectorState, activity: Activity, accepted: Ac
 export async function runOnce(config: CollectorConfig, state: CollectorState, signal?: AbortSignal): Promise<{ activities: Activity[]; clip?: string }> {
   const logger = collectorLogger({ dataDirectory: config.dataDir });
   const tracer = collectorTracer({ dataDirectory: config.dataDir });
+  const reporter = createErrorReporter({ dataDirectory: config.dataDir });
   throwIfAborted(signal);
   let observed: Topology;
   try {
     observed = await readTopology(config, signal);
   } catch (error) {
-    if (!state.topology) throw error;
+      if (!state.topology) { if (!signal?.aborted) await reporter.report({ service: "collector", operation: "capture.topology", category: "capture", error, trace: (error as Error & { trace?: import("./shared").TraceContext }).trace ?? { sourceId: config.sourceNamespace } }); throw error; }
     state.topology.source.stale = true;
     addStatus(state, "source", "error", error instanceof Error ? error.message.slice(0, 240) : "Topology observation failed");
     await persist(config.dataDir, state);
@@ -450,7 +458,8 @@ export async function runOnce(config: CollectorConfig, state: CollectorState, si
       const activities = participant.sessionId
         ? await captureParticipant(participant, staged, signal, config.dataDir, captureSpan.context)
         : await captureTerminalFallback(participant, staged, signal, config.dataDir, captureSpan.context);
-      for (const activity of activities) activity.trace = captureSpan.context;
+        for (const activity of activities) activity.trace = captureSpan.context;
+        for (const activity of activities.filter((activity) => activity.status === "gap")) await reporter.report({ service: "collector", operation: "capture.observe", category: "malformed_output", error: new Error("Capture produced an unrecoverable gap"), trace: captureSpan.context, context: { activityId: activity.id, captureMode: activity.captureMode, originalTextBytes: activity.originalTextBytes } });
       for (const activity of activities) await logger.log(activity.status === "gap" ? "warn" : "info", { operation: activity.captureMode === "structured" ? "capture.transcript" : "capture.terminal", message: "Captured observation activity", outcome: activity.status, participantId: participant.id, sourceId: config.sourceNamespace, metadata: { operationId: activity.id, sourceCursor: activity.sourceCursor, originalTextBytes: activity.originalTextBytes } });
       const admitted: Activity[] = [];
       for (const activity of activities) {
@@ -477,10 +486,12 @@ export async function runOnce(config: CollectorConfig, state: CollectorState, si
         addStatus(next, participant.id, "limited", "No exact session reference. Read-only terminal fallback is limited.");
       }
       await captureSpan.end("succeeded");
-    } catch (error) {
-      await captureSpan.end(signal?.aborted ? "cancelled" : "failed");
-      addStatus(next, participant.id, participant.sessionId ? "unavailable" : "limited", error instanceof Error ? error.message.slice(0, 240) : "Source observation failed");
-      await logger.log("error", { operation: "capture.observe", message: "Capture observation failed", outcome: "failed", participantId: participant.id, sourceId: config.sourceNamespace, metadata: { error: error instanceof Error ? error.message : "unknown" } });
+      } catch (error) {
+        await captureSpan.end(signal?.aborted ? "cancelled" : "failed");
+        if (signal?.aborted) break;
+        addStatus(next, participant.id, participant.sessionId ? "unavailable" : "limited", error instanceof Error ? error.message.slice(0, 240) : "Source observation failed");
+        await logger.log("error", { operation: "capture.observe", message: "Capture observation failed", outcome: "failed", participantId: participant.id, sourceId: config.sourceNamespace, metadata: { error: error instanceof Error ? error.message : "unknown" } });
+        await reporter.report({ service: "collector", operation: "capture.observe", category: "capture", error, trace: captureSpan.context, context: { participantId: participant.id, sourceId: config.sourceNamespace } });
     }
   }
   throwIfAborted(signal);
