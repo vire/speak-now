@@ -24,12 +24,17 @@ Speak Now uses Bun, TypeScript, and React to turn existing Herdr agent updates i
 - Agents must not add `merge-authorized` themselves to authorize a merge.
 - Direct pushes or force pushes that would cause an open PR to be marked merged require the same label check.
 
+## Plans and local artifacts
+
+- Never commit implementation plans, task plans, handoffs, or local review/evidence files. Keep them in ignored `tmp/` or the shared taskboard; put reviewer-facing scope and validation in the PR description.
+- Before committing, inspect the staged file list and unstage any plan or local coordination artifact.
+
 ## Behavior changes
 
 - **Spec -> test -> code, in that order. Always.** Every behavior change follows the triad:
 
   1. **Spec** - the intended behavior is written down before any test or code exists. The task as stated,
-     a Linear issue, or a `docs/plans/*.md` all count; if none covers the change, write the spec yourself
+     a Linear issue, or an ignored local spec in `tmp/` all count; if none covers the change, write the spec yourself
      (a paragraph is enough) where the reviewer will read it: the top of the PR description, or the
      hand-back when the change stays in the working tree. An agent-written spec counts, and nobody's
      approval gates the next step. What makes it a spec is that it comes first and is concrete: the
