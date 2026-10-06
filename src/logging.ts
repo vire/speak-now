@@ -8,7 +8,7 @@ export interface LoggerOptions { service: LogService; dataDirectory?: string; di
 export interface LoggerStatus { destinationAvailable: boolean; pendingEntries: number; droppedEntries: number; lastFailure?: string; lastFailureAt?: string; }
 export interface Logger { log(level: LogLevel, fields: LogFields): Promise<void>; flush(): Promise<void>; getStatus(): LoggerStatus; }
 interface SinkConfig { maxFileBytes: number; maxMetadataBytes: number; maxRecordBytes: number; maxQueueEntries: number; maxRetainedFiles: number; retentionMs: number; }
-interface Sink { config: SinkConfig; directory: string; filename: string; path: string; service: LogService; serializeAcrossProcesses: boolean; tail: Promise<void>; pendingEntries: number; droppedEntries: number; destinationAvailable: boolean; lastFailure?: string; lastFailureAt?: string; lastFallbackAt: number; prepared: boolean; rotationSequence: number; activeStartedAt?: number; }
+interface Sink { config: SinkConfig; directory: string; filename: string; path: string; service: LogService; serializeAcrossProcesses: boolean; tail: Promise<void>; pendingEntries: number; droppedEntries: number; destinationAvailable: boolean; lastFailure?: string; lastFailureAt?: string; lastFallbackAt: number; rotationSequence: number; }
 
 const levelRank: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 const secretKey = /authorization|token|secret|password|api[-_]?key|credential|cookie|session/i;
@@ -150,7 +150,7 @@ function validLines(text: string, startsAtBoundary: boolean, sink: Sink): string
   }
   return retained;
 }
-async function reconcileExistingFile(sink: Sink, path: string): Promise<number | undefined> {
+async function reconcileExistingFile(sink: Sink, path: string): Promise<void> {
   const existing = await stat(path);
   const { text, startsAtBoundary } = existing.size <= sink.config.maxFileBytes
     ? { text: await readFile(path, "utf8"), startsAtBoundary: true }
@@ -166,34 +166,13 @@ async function reconcileExistingFile(sink: Sink, path: string): Promise<number |
     else await unlink(path);
     diagnostic(sink, "reconciled existing log file to configured limits", false);
   }
-  const first = lines[0];
-  if (!first) return undefined;
-  try {
-    const timestamp = Date.parse(JSON.parse(first).timestamp);
-    return Number.isFinite(timestamp) ? timestamp : existing.mtimeMs;
-  } catch { return existing.mtimeMs; }
 }
 async function maintain(sink: Sink): Promise<void> {
   const entries = await readdir(sink.directory, { withFileTypes: true });
   for (const entry of entries) if (entry.isFile() && (entry.name === sink.filename || entry.name.startsWith(`${sink.service}.`) && entry.name.endsWith(".jsonl"))) {
-    try { const first = await reconcileExistingFile(sink, join(sink.directory, entry.name)); if (entry.name === sink.filename) sink.activeStartedAt = first; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try { await reconcileExistingFile(sink, join(sink.directory, entry.name)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
   await prune(sink);
-}
-async function prepare(sink: Sink): Promise<void> {
-  if (sink.prepared) return;
-  await mkdir(sink.directory, { recursive: true });
-  try {
-    sink.activeStartedAt = await reconcileExistingFile(sink, sink.path);
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const entries = await readdir(sink.directory, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name !== sink.filename && entry.name.startsWith(`${sink.service}.`) && entry.name.endsWith(".jsonl")) {
-      await reconcileExistingFile(sink, join(sink.directory, entry.name));
-    }
-  }
-  await maintain(sink);
-  sink.prepared = true;
 }
 async function append(sink: Sink, line: string): Promise<void> {
   if (sink.serializeAcrossProcesses) {
@@ -204,16 +183,13 @@ async function append(sink: Sink, line: string): Promise<void> {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await Bun.sleep(2); }
     }
   }
-  await prepare(sink);
+  await mkdir(sink.directory, { recursive: true });
   await maintain(sink);
   try {
     const current = await stat(sink.path);
-    if (current.size + utf8(line) > sink.config.maxFileBytes) { const suffix = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}-${sink.rotationSequence += 1}`; await rename(sink.path, join(sink.directory, `${sink.service}.${suffix}.jsonl`)); sink.activeStartedAt = undefined; await prune(sink); }
+    if (current.size + utf8(line) > sink.config.maxFileBytes) { const suffix = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}-${sink.rotationSequence += 1}`; await rename(sink.path, join(sink.directory, `${sink.service}.${suffix}.jsonl`)); await prune(sink); }
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   await writeFile(sink.path, line, { encoding: "utf8", flag: "a" });
-  if (sink.activeStartedAt === undefined) {
-    try { sink.activeStartedAt = Date.parse(JSON.parse(line).timestamp); } catch { sink.activeStartedAt = Date.now(); }
-  }
   sink.destinationAvailable = true;
 }
 function getSink(options: LoggerOptions): Sink {
@@ -223,7 +199,7 @@ function getSink(options: LoggerOptions): Sink {
   const path = join(directory, filename);
   const existing = sinks.get(path);
   if (existing) { if (!sameConfig(existing.config, config)) throw new TypeError(`incompatible logger configuration for ${path}`); return existing; }
-  const sink: Sink = { config, directory, filename, path, service: options.service, serializeAcrossProcesses: options.serializeAcrossProcesses ?? false, tail: Promise.resolve(), pendingEntries: 0, droppedEntries: 0, destinationAvailable: true, lastFallbackAt: 0, prepared: false, rotationSequence: 0 };
+  const sink: Sink = { config, directory, filename, path, service: options.service, serializeAcrossProcesses: options.serializeAcrossProcesses ?? false, tail: Promise.resolve(), pendingEntries: 0, droppedEntries: 0, destinationAvailable: true, lastFallbackAt: 0, rotationSequence: 0 };
   sinks.set(path, sink);
   return sink;
 }

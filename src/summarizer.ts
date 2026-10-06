@@ -129,12 +129,12 @@ export async function summarize(input: SummaryInput, backend = (Bun.env.SUMMARY_
       child.stdin.end();
       stdoutDrain = drain(child.stdout, outputLimit.stdout, controller.signal, () => terminate("output"));
       stderrDrain = drain(child.stderr, outputLimit.stderr, controller.signal, () => terminate("output"));
-      const [stdout, stderr] = await Promise.all([stdoutDrain, stderrDrain]);
+      const [stdout] = await Promise.all([stdoutDrain, stderrDrain]);
       await child.exited;
       if (stopReason === "cancelled") throw abortError();
       if (stopReason === "deadline") throw new Error(`${backend} summary process timed out`);
       if (stopReason === "output") throw new Error("summary process output exceeded its limit");
-      if (child.exitCode !== 0) throw new Error(`${backend} summary process failed with exit ${child.exitCode}: ${sanitizeProviderError(stderr || stdout)}`);
+      if (child.exitCode !== 0) throw new Error(`${backend} summary process failed with exit ${child.exitCode}`);
           const summary = validateSummary(claudeStructuredOutput(stdout), input.evidenceEventIds);
           await logger?.log("info", { operation: "summary.process", message: "Completed isolated summary process", outcome: "succeeded", metadata: { operationId, kind: summary.kind } });
           await cliSpan?.end("succeeded", { metadata: { exitCode: child.exitCode } });
@@ -181,8 +181,4 @@ function decodeClaudeCarrier(carrier: string): unknown {
     if (!fence) throw new Error("Claude result carrier is invalid");
     try { return JSON.parse(fence[1]); } catch { throw new Error("Claude result carrier is invalid"); }
   }
-}
-
-function sanitizeProviderError(output: string): string {
-  try { const event = JSON.parse(output.split("\n").filter(Boolean).at(-1) ?? "{}") as { result?: string }; return typeof event.result === "string" ? event.result.slice(0, 240) : "no provider error detail"; } catch { return "no provider error detail"; }
 }
