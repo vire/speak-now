@@ -62,10 +62,23 @@ export interface JobReceipt { jobId: string; announcementId?: string; resultKey:
 export type CompleteJobOutcome = { kind: "accepted" | "duplicate"; receipt: JobReceipt } | { kind: "conflict"; code: ConflictCode } | { kind: "missing" };
 export type ListeningSelection = Omit<ListeningScope, "generation"> | null;
 export type SetListeningScopeOutcome = { kind: "changed" | "unchanged"; scope: ListeningScope | null; generation: number } | { kind: "unknown"; code: "source" | "workspace" | "tab" | "scope" };
-export interface StateDto { sources: Array<{ sourceId: SourceId; stale: boolean; observedAt: string; topologySequence: number; listeningGeneration: number }>; topology: Topology | null; scope: ListeningScope | null; jobs: { pending: number; leased: number; completed: number; expired: number }; announcements: { count: number }; eventSequence: number; }
-export interface HistoryQuery { cursor?: string; limit?: number; }
+export interface CaptureFact { captureMode: Activity["captureMode"]; status: Activity["status"]; truncated: boolean; observedAt: string; expiresAt: string; }
+export interface CaptureByParticipant { participantId: ParticipantId; capture: CaptureFact | null; }
+export interface StateDto { sources: Array<{ sourceId: SourceId; stale: boolean; observedAt: string; topologySequence: number; listeningGeneration: number }>; topology: Topology | null; scope: ListeningScope | null; captureByParticipant: CaptureByParticipant[]; jobs: { pending: number; leased: number; completed: number; expired: number }; announcements: { count: number }; eventSequence: number; }
+export interface StateQuery { sourceId?: SourceId; }
+export interface HistoryQuery {
+  sourceId?: SourceId;
+  workspaceId?: WorkspaceId;
+  tabId?: TabId;
+  participantId?: ParticipantId;
+  from?: string;
+  to?: string;
+  cursor?: string;
+  limit?: number;
+  order?: "asc" | "desc";
+}
 export interface CaptureContext { workspace?: { id: string; label: string }; tab?: { id: string; label: string }; pane?: { id: string; label?: string }; participant: { id: string; kind: string }; }
-export interface HistoryPage { announcements: Array<{ id: string; jobId: string; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; createdAt: string; result: SummaryResult; capture: CaptureContext }>; nextCursor?: string; }
+export interface HistoryPage { announcements: Array<{ id: string; jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; result: SummaryResult; capture: CaptureContext }>; nextCursor?: string; }
 export type EventsSinceOutcome = { kind: "events"; events: Array<{ sequence: number; kind: string; value: unknown }>; latestSequence: number } | { kind: "expired" };
 export interface PruneResult { expiredEvidence: number; expiredHistory: number; expiredMedia: number; terminalizedJobs: number; }
 
@@ -75,7 +88,7 @@ export interface Storage {
   claimJob(workerId: string): StorageEffect<ClaimJobOutcome>;
   completeJob(jobId: string, completion: JobCompletion): StorageEffect<CompleteJobOutcome>;
   setListeningScope(selection: ListeningSelection): StorageEffect<SetListeningScopeOutcome>;
-  getState(): StorageEffect<StateDto>;
+  getState(query?: StateQuery): StorageEffect<StateDto>;
   getHistory(query: HistoryQuery): StorageEffect<HistoryPage>;
   getEventsSince(sequence: number): StorageEffect<EventsSinceOutcome>;
   prune(): StorageEffect<PruneResult>;
@@ -168,7 +181,16 @@ function captureContext(topology: Topology, participantId: ParticipantId): Captu
   const pane = participant && topology.panes.find((item) => item.id === participant.paneId);
   const tab = pane && topology.tabs.find((item) => item.id === pane.tabId);
   const workspace = tab && topology.workspaces.find((item) => item.id === tab.workspaceId);
-  return { ...(workspace ? { workspace: { id: workspace.id, label: workspace.label } } : {}), ...(tab ? { tab: { id: tab.id, label: tab.label } } : {}), ...(pane ? { pane: { id: pane.id, ...(pane.label ? { label: pane.label } : {}) } } : {}), participant: { id: participantId, kind: participant?.kind ?? "unknown" } };
+  return { ...(workspace ? { workspace: { id: workspace.id, label: workspace.label || workspace.id } } : {}), ...(tab ? { tab: { id: tab.id, label: tab.label || tab.id } } : {}), ...(pane ? { pane: { id: pane.id, label: pane.label || pane.id } } : {}), participant: { id: participantId, kind: participant?.kind ?? "unknown" } };
+}
+
+function historyCapture(capture: CaptureContext): CaptureContext {
+  return {
+    ...capture,
+    ...(capture.workspace ? { workspace: { ...capture.workspace, label: capture.workspace.label || capture.workspace.id } } : {}),
+    ...(capture.tab ? { tab: { ...capture.tab, label: capture.tab.label || capture.tab.id } } : {}),
+    ...(capture.pane ? { pane: { ...capture.pane, label: capture.pane.label || capture.pane.id } } : {}),
+  };
 }
 
 function event(db: SQLiteAdapter, kind: string, value: unknown): number {
@@ -344,31 +366,48 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       event(db, "listening", { sourceId: selection.sourceId, generation });
       return { kind: "changed", scope: { ...selection, generation }, generation };
     })),
-    getState: () => safe("get state", () => transaction(db, () => {
+    getState: (query = {}) => safe("get state", () => transaction(db, () => {
+      const snapshotAt = now();
       const sources = all<SourceRow>(db, "SELECT * FROM sources ORDER BY source_id");
       const active = sources.find((source) => source.scope_json);
-      const source = active ?? sources[0];
+      const source = query.sourceId ? sources.find((item) => item.source_id === query.sourceId) : active ?? sources[0];
       const topology = source ? {
         source: { id: source.source_id as SourceId, namespace: source.source_id.split(":", 1)[0] ?? source.source_id, stale: Boolean(source.stale) || stale(source.observed_at), observedAt: source.observed_at },
-        workspaces: all<Topology["workspaces"][number]>(db, "SELECT workspace_id AS id, source_id AS sourceId, label, ordering AS 'order', live FROM workspaces WHERE source_id = ? AND present = 1 ORDER BY ordering", source.source_id),
+          workspaces: all<Omit<Topology["workspaces"][number], "live"> & { live: number }>(db, "SELECT workspace_id AS id, source_id AS sourceId, label, ordering AS 'order', live FROM workspaces WHERE source_id = ? AND present = 1 ORDER BY ordering", source.source_id).map(({ live, ...workspace }) => ({ ...workspace, live: live === 1 })),
         tabs: all<Topology["tabs"][number]>(db, "SELECT tabs.tab_id AS id, tabs.workspace_id AS workspaceId, tabs.label, tabs.ordering AS 'order' FROM tabs JOIN workspaces ON workspaces.workspace_id = tabs.workspace_id WHERE tabs.present = 1 AND workspaces.present = 1 AND workspaces.source_id = ? ORDER BY tabs.ordering", source.source_id),
-        panes: all<Topology["panes"][number]>(db, "SELECT panes.pane_id AS id, panes.tab_id AS tabId, panes.terminal_id AS terminalId, panes.cwd, panes.label FROM panes JOIN tabs ON tabs.tab_id = panes.tab_id JOIN workspaces ON workspaces.workspace_id = tabs.workspace_id WHERE panes.present = 1 AND tabs.present = 1 AND workspaces.present = 1 AND workspaces.source_id = ? ORDER BY panes.pane_id", source.source_id),
+          panes: all<Omit<Topology["panes"][number], "cwd" | "label"> & { cwd: string | null; label: string | null }>(db, "SELECT panes.pane_id AS id, panes.tab_id AS tabId, panes.terminal_id AS terminalId, panes.cwd, panes.label FROM panes JOIN tabs ON tabs.tab_id = panes.tab_id JOIN workspaces ON workspaces.workspace_id = tabs.workspace_id WHERE panes.present = 1 AND tabs.present = 1 AND workspaces.present = 1 AND workspaces.source_id = ? ORDER BY panes.pane_id", source.source_id).map(({ cwd, label, ...pane }) => ({ ...pane, ...(cwd === null ? {} : { cwd }), ...(label === null ? {} : { label }) })),
         participants: all<{ value_json: string }>(db, "SELECT value_json FROM participants WHERE source_id = ? AND present = 1 ORDER BY participant_id", source.source_id).map((row) => JSON.parse(row.value_json) as Topology["participants"][number]),
       } satisfies Topology : null;
+      const captureByParticipant = topology?.participants.map((participant) => {
+        const row = one<{ evidence_json: string; observed_at: string; expires_at: string }>(db, "SELECT evidence_json, observed_at, expires_at FROM events WHERE source_id = ? AND participant_id = ? AND evidence_json IS NOT NULL AND expires_at > ? ORDER BY expires_at DESC, rowid DESC LIMIT 1", topology.source.id, participant.id, snapshotAt);
+        if (!row) return { participantId: participant.id, capture: null };
+        const activity = JSON.parse(row.evidence_json) as Pick<Activity, "captureMode" | "status" | "truncated">;
+        return { participantId: participant.id, capture: { captureMode: activity.captureMode, status: activity.status, truncated: activity.truncated, observedAt: row.observed_at, expiresAt: row.expires_at } };
+      }) ?? [];
       const jobs = all<{ status: string; count: number }>(db, "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status");
       const count = (status: string) => jobs.find((row) => row.status === status)?.count ?? 0;
       const floor = Number(one<{ value: string }>(db, "SELECT value FROM storage_meta WHERE key = 'event_floor'")?.value ?? "1");
       const latestEvent = Number(one<{ value: number }>(db, "SELECT COALESCE(MAX(sequence), 0) AS value FROM durable_events")?.value ?? 0);
-      return { sources: sources.map((item) => ({ sourceId: item.source_id as SourceId, stale: Boolean(item.stale) || stale(item.observed_at), observedAt: item.observed_at, topologySequence: item.topology_sequence, listeningGeneration: item.listening_generation })), topology, scope: active ? currentScope(active) : null, jobs: { pending: count("pending"), leased: count("leased"), completed: count("completed"), expired: count("expired") }, announcements: { count: Number(one<{ value: number }>(db, "SELECT COUNT(*) AS value FROM announcements")?.value ?? 0) }, eventSequence: Math.max(latestEvent, floor - 1) };
+      return { sources: sources.map((item) => ({ sourceId: item.source_id as SourceId, stale: Boolean(item.stale) || stale(item.observed_at), observedAt: item.observed_at, topologySequence: item.topology_sequence, listeningGeneration: item.listening_generation })), topology, scope: active ? currentScope(active) : null, captureByParticipant, jobs: { pending: count("pending"), leased: count("leased"), completed: count("completed"), expired: count("expired") }, announcements: { count: Number(one<{ value: number }>(db, "SELECT COUNT(*) AS value FROM announcements")?.value ?? 0) }, eventSequence: Math.max(latestEvent, floor - 1) };
     })),
     getHistory: (query) => safe("get history", () => {
       const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
-      const cursor = query.cursor ? Number(query.cursor) : 0;
-      const rows = all<{ rowid: number; job_id: string; created_at: string; result_json: string; capture_json: string }>(db, "SELECT rowid, job_id, created_at, result_json, capture_json FROM jobs WHERE status = 'completed' AND result_json IS NOT NULL AND capture_json IS NOT NULL AND rowid > ? ORDER BY rowid LIMIT ?", cursor, limit + 1);
+      const direction = query.order === "desc" ? "DESC" : "ASC";
+      const predicates = ["status = 'completed'", "result_json IS NOT NULL", "capture_json IS NOT NULL"];
+      const values: unknown[] = [];
+      const add = (predicate: string, value: unknown) => { predicates.push(predicate); values.push(value); };
+      if (query.sourceId) add("source_id = ?", query.sourceId);
+      if (query.workspaceId) add("json_extract(capture_json, '$.workspace.id') = ?", query.workspaceId);
+      if (query.tabId) add("json_extract(capture_json, '$.tab.id') = ?", query.tabId);
+      if (query.participantId) add("participant_id = ?", query.participantId);
+      if (query.from) add("created_at >= ?", query.from);
+      if (query.to) add("created_at <= ?", query.to);
+      if (query.cursor) add(`rowid ${direction === "DESC" ? "<" : ">"} ?`, Number(query.cursor));
+      const rows = all<{ rowid: number; job_id: string; source_id: string; participant_id: string; created_at: string; result_json: string; capture_json: string }>(db, `SELECT rowid, job_id, source_id, participant_id, created_at, result_json, capture_json FROM jobs WHERE ${predicates.join(" AND ")} ORDER BY rowid ${direction} LIMIT ?`, ...values, limit + 1);
       const page = rows.slice(0, limit);
       const ids = page.map((row) => row.job_id);
-      const announcements = ids.length ? all<{ announcement_id: string; job_id: string; created_at: string; summary_json: string }>(db, `SELECT announcement_id, job_id, created_at, summary_json FROM announcements WHERE job_id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at`, ...ids) : [];
-      return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: JSON.parse(row.capture_json) as CaptureContext })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
+      const announcements = ids.length ? all<{ announcement_id: string; job_id: string; source_id: string; participant_id: string; created_at: string; summary_json: string }>(db, `SELECT announcement_id, job_id, source_id, participant_id, created_at, summary_json FROM announcements WHERE job_id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at`, ...ids) : [];
+      return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: historyCapture(JSON.parse(row.capture_json) as CaptureContext) })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
     }),
     getEventsSince: (sequence) => safe("get events", () => {
       const floor = Number(one<{ value: string }>(db, "SELECT value FROM storage_meta WHERE key = 'event_floor'")?.value ?? "1");

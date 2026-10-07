@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as Effect from "effect/Effect";
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -315,6 +316,64 @@ test("state indicators and history retain capture-time location after a topology
     expect(result.state.jobs).toEqual({ pending: 0, leased: 0, completed: 1, expired: 0 });
     expect(result.state.announcements).toEqual({ count: 1 });
     expect(result.history.results).toEqual([expect.objectContaining({ result: expect.objectContaining({ text: "stored" }), capture: expect.objectContaining({ workspace: expect.objectContaining({ label: "Fixture" }), tab: expect.objectContaining({ label: "Fixture tab" }), pane: expect.objectContaining({ id: "fixture:pane" }) }) })]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("history uses captured IDs when a source snapshot has no display labels", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const history = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      const unlabeled = topology();
+      unlabeled.workspaces[0]!.label = "";
+      unlabeled.tabs[0]!.label = "";
+      unlabeled.panes[0]!.label = undefined;
+      yield* storage.ingestBatch(batch({ batchId: "unlabeled-history", topologySequence: 2, topology: unlabeled, cursors: [{ participantId, previous: "cursor:baseline", next: "cursor:unlabeled" }], activities: [activity("unlabeled-event", "cursor:unlabeled")] }));
+      const claim = yield* storage.claimJob("worker-a");
+      if (claim.kind !== "claimed") throw new Error("expected job");
+      yield* storage.completeJob(claim.job.id, { leaseToken: claim.job.leaseToken, resultKey: "unlabeled", result: { speak: false, kind: "progress", text: "stored", evidenceEventIds: ["unlabeled-event"] } });
+      return yield* storage.getHistory({});
+    }));
+
+    expect(history.results).toEqual([expect.objectContaining({
+      capture: expect.objectContaining({
+        workspace: expect.objectContaining({ id: workspaceId, label: workspaceId }),
+        tab: expect.objectContaining({ id: "fixture:tab", label: "fixture:tab" }),
+        pane: expect.objectContaining({ id: "fixture:pane", label: "fixture:pane" }),
+      }),
+    })]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("history restores ID labels for retained legacy context with missing labels", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch());
+      const claim = yield* storage.claimJob("worker-a");
+      if (claim.kind !== "claimed") throw new Error("expected job");
+      yield* storage.completeJob(claim.job.id, { leaseToken: claim.job.leaseToken, resultKey: "legacy-labels", result: { speak: false, kind: "progress", text: "stored", evidenceEventIds: ["event-a"] } });
+    }));
+    const database = new Database(join(dataDir, "speak-now.sqlite"));
+    try {
+      database.run("UPDATE jobs SET capture_json = ? WHERE status = 'completed'", [JSON.stringify({ workspace: { id: workspaceId, label: "" }, tab: { id: "fixture:tab", label: "" }, pane: { id: "fixture:pane" }, participant: { id: participantId, kind: "codex" } })]);
+    } finally {
+      database.close();
+    }
+    const history = await useStorage(dataDir, (storage) => storage.getHistory({}));
+
+    expect(history.results).toEqual([expect.objectContaining({
+      capture: expect.objectContaining({
+        workspace: expect.objectContaining({ label: workspaceId }),
+        tab: expect.objectContaining({ label: "fixture:tab" }),
+        pane: expect.objectContaining({ label: "fixture:pane" }),
+      }),
+    })]);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
