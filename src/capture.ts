@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Activity, AgentKind, CaptureStatus, Cursor, Pane, Participant, Source, Tab, Topology, Workspace } from "./shared";
-import { opaqueId } from "./shared";
+import { COLLECTOR_WIRE_LIMITS, opaqueId } from "./shared";
 
-export const MAX_CAPTURE_TEXT_BYTES = 20_000;
+export const MAX_CAPTURE_TEXT_BYTES = COLLECTOR_WIRE_LIMITS.activityTextBytes;
 type Json = Record<string, unknown>;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -163,14 +163,31 @@ export function topologyFromHerdr(namespace: string, snapshot: Snapshot, observe
   });
   return { source, workspaces, tabs, panes, participants };
 }
-export function reconcileTopology(previous: Topology, next: Topology): Topology {
+function retainedGeneration(namespace: string, participant: Participant, retainedIds: Iterable<string>): number | undefined {
+  const identity = participantIdentity(participant);
+  const prefix = `${namespace}:${identity}:`;
+  const generations = new Set<number>();
+  for (const id of retainedIds) {
+    if (!id.startsWith(prefix)) continue;
+    const suffix = id.slice(prefix.length);
+    if (!/^(0|[1-9]\d*)$/.test(suffix)) continue;
+    const generation = Number(suffix);
+    if (!Number.isSafeInteger(generation) || `${prefix}${generation}` !== id) continue;
+    generations.add(generation);
+  }
+  if (generations.size > 1) throw new Error("Ambiguous retained collector participant identity");
+  return generations.values().next().value;
+}
+
+export function reconcileTopology(previous: Topology, next: Topology, retainedIds: Iterable<string> = []): Topology {
   return {
     ...next,
     participants: next.participants.map((participant) => {
       const identity = participantIdentity(participant);
       const exact = previous.participants.find((item) => participantIdentity(item) === identity);
       const samePane = previous.participants.find((item) => item.rawPaneId === participant.rawPaneId);
-      const generation = exact?.generation ?? (samePane ? samePane.generation + 1 : 0);
+      const retained = exact ? undefined : retainedGeneration(next.source.namespace, participant, retainedIds);
+      const generation = exact?.generation ?? retained ?? (samePane ? samePane.generation + 1 : 0);
       return { ...participant, generation, id: opaqueId(next.source.namespace, `${identity}:${generation}`) };
     }),
   };

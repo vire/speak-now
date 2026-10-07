@@ -29,6 +29,24 @@ Exact transcript capture requires the complete Herdr reference kind, source, and
 
 Structured records up to 2 MB are supported with a UTF-8-safe 20 KB latest-text tail for summary evidence. Larger complete records are scanned in bounded passes, recorded as an explicit gap, and do not silently advance an unverified session. Terminal fallback evidence and its overlap cache use the same 20 KB bound.
 
+## Remote collector connection
+
+Run the collector on the host that owns Herdr and point it at the local app or container. Keep the host collector state directory persistent and distinct from the container's `/data` directory.
+
+```sh
+SPEAK_NOW_COLLECTOR_URL=http://127.0.0.1:3000 \
+SPEAK_NOW_COLLECTOR_TOKEN='set-the-same-secret-on-server-and-host' \
+SOURCE_NAMESPACE='stable-host-namespace' \
+SUMMARY_WORKER_ID='stable-worker-id' \
+SPEAK_NOW_DATA_DIR=/var/lib/speak-now-host \
+OBSERVATION_EXCLUDE_PANES="raw:$HERDR_PANE_ID" \
+bun src/collector.ts
+```
+
+Set the same nonempty `SPEAK_NOW_COLLECTOR_TOKEN` for the app server. It is required for every `/api/collector/*` route and is never exposed through browser config or diagnostics. `SOURCE_NAMESPACE` and `SUMMARY_WORKER_ID` must remain stable. `SOURCE_EPOCH` is persisted automatically: changing it is not a recovery operation. Exclude implementation and review panes with their explicit raw IDs.
+
+Collector envelopes use finite shared limits: 20,000 UTF-8 bytes for activity text and opaque cursor tokens, 65,536 encoded bytes for a complete topology, and 524,288 encoded bytes for a request or collector response. A collector retries the exact persisted body and batch identity. A saved body beyond the request limit remains recovery-blocked: it is not sent, reset, split, or assigned a replacement identity.
+
 Live speech needs both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`. Audio is written atomically to `data/audio/`. Without both values, the code reports the explicit prerequisite instead of pretending playback occurred.
 
 Open the app and select **Enable audio** once to grant browser playback permission. The page polls only the local prototype announcement endpoint and plays a completed saved MP3 once per clip key.
@@ -39,10 +57,18 @@ Open the app and select **Enable audio** once to grant browser playback permissi
 | --- | --- |
 | `GET /api/health` | `{ "status": "ok" }` |
 | `GET /api/hello` | `{ "message": "Hello from Speak Now!" }` |
-| `GET /api/config` | Local collector command, live speech configuration, and diagnostic/report destination status |
+| `GET /api/config` | Safe local speech and diagnostic configuration status |
 | `POST /api/client-errors` | Same-origin JSON error report, returning `{ "reportId": "..." }` with status 202 |
 | `GET /api/prototype/latest` | The latest completed local announcement, if any |
 | `GET /api/prototype/audio/:key` | A completed local MP3 for a validated clip key |
+| `POST /api/collector/batches` | Authenticated durable topology, activity, cursor, and receipt ingestion |
+| `GET /api/collector/config?sourceId=...` | Authenticated source scope, generation, freshness, and bounded worker settings |
+| `POST /api/collector/jobs/claim` | Authenticated bounded worker job claim, or 204 when no work is available |
+| `POST /api/collector/jobs/:jobId/result` | Authenticated fenced durable job completion |
+| `PUT /api/listening` | Same-origin selection of a known source workspace or tab |
+| `GET /api/state` | Current topology, freshness, scope, job indicators, and durable event sequence |
+| `GET /api/history` | Bounded paginated announcement and completion history |
+| `GET /api/events` | Same-origin durable SSE replay and live state/history events |
 
 Set `PORT` to change the listen port (default: `3000`).
 

@@ -101,3 +101,24 @@ export interface Topology {
 
 export const opaqueId = <T extends string>(namespace: string, id: string) =>
   `${namespace}:${id}` as T;
+
+export const COLLECTOR_WIRE_LIMITS = {
+  activityTextBytes: 20_000,
+  cursorTokenBytes: 20_000,
+  requestBytes: 524_288,
+  responseBytes: 524_288,
+  topologyBytes: 65_536,
+  maxArrayItems: 1_000,
+} as const;
+
+const sortCollectorJson = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(sortCollectorJson);
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(object).sort().flatMap((key) => object[key] === undefined ? [] : [[key, sortCollectorJson(object[key])]]));
+  }
+  return value;
+};
+
+export const encodeCollectorJson = (value: unknown): string => JSON.stringify(sortCollectorJson(value)) ?? "null";
+export const collectorUtf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength;

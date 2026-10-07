@@ -83,17 +83,55 @@ test("expires aged active rows while later rows continue", async () => {
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
 
-// Contract: a live sink removes expired rows even while later calls keep its file fresh.
-// Regression: pruning file mtime retained old rows through continuous traffic.
+// Contract: a live sink removes expired rows on each append even while its file stays fresh, but an idle flush does not reconcile rows.
+// Regression: pruning file mtime retained old rows through continuous traffic, or flush unexpectedly changed idle rows.
 test("expires old rows during continuous writes", async () => {
+  const fixture = `
+    import assert from "node:assert/strict";
+    import { readFile, readdir, stat } from "node:fs/promises";
+    import { join } from "node:path";
+    import { setSystemTime } from "bun:test";
+    import { createTracer } from ${JSON.stringify(join(process.cwd(), "src/tracing.ts"))};
+
+    const dataDir = process.argv[1];
+    const traces = join(dataDir, "traces");
+    const rows = async () => (await readFile(join(traces, (await readdir(traces)).find((entry) => entry.startsWith("writer-"))!, "calls.jsonl"), "utf8")).trim().split("\\n").map(JSON.parse);
+    let now = Date.parse("2000-01-01T00:00:00.000Z");
+    setSystemTime(new Date(now));
+    try {
+      const tracer = createTracer({ dataDirectory: dataDir, retentionDays: 100 / 86_400_000 });
+      for (let index = 0; index < 7; index += 1) {
+        await tracer.start(\`row-\${index}\`).end("succeeded");
+        if (index < 6) setSystemTime(new Date(now += 20));
+      }
+      await tracer.flush();
+      const retained = await rows();
+      assert.deepEqual(retained.map((row) => row.operation), ["row-1", "row-2", "row-3", "row-4", "row-5", "row-6"]);
+      assert.deepEqual(retained.map((row) => Date.now() - Date.parse(row.endedAt)), [100, 80, 60, 40, 20, 0]);
+      assert.ok((await stat(join(traces, (await readdir(traces)).find((entry) => entry.startsWith("writer-"))!, "calls.jsonl"))).mtimeMs > Date.now());
+      setSystemTime(new Date(now += 160));
+      await tracer.flush();
+      assert.deepEqual((await rows()).map((row) => row.operation), retained.map((row) => row.operation));
+      assert.deepEqual(tracer.getStatus(), { destinationAvailable: true, pendingEntries: 0, droppedEntries: 0 });
+      await tracer.start("row-after-idle").end("succeeded");
+      await tracer.flush();
+      assert.deepEqual((await rows()).map((row) => row.operation), ["row-after-idle"]);
+      assert.deepEqual(tracer.getStatus(), { destinationAvailable: true, pendingEntries: 0, droppedEntries: 0 });
+    } finally {
+      setSystemTime();
+    }
+  `;
   const dataDir = await mkdtemp(join(tmpdir(), "speak-now-trace-continuous-"));
+  let child: ReturnType<typeof Bun.spawn> | undefined;
   try {
-    const tracer = createTracer({ dataDirectory: dataDir, retentionDays: 100 / 86_400_000 });
-    for (let index = 0; index < 7; index += 1) { await tracer.start(`row-${index}`).end("succeeded"); await Bun.sleep(20); }
-    await tracer.flush();
-    const rows = (await traceText(join(dataDir, "traces")).then((text) => text.trim())).split("\n").map((line) => JSON.parse(line));
-    expect(rows.every((row) => Date.now() - Date.parse(row.endedAt) <= 120)).toBe(true);
-  } finally { await rm(dataDir, { recursive: true, force: true }); }
+    child = Bun.spawn([process.execPath, "--no-env-file", "-e", fixture, dataDir], { stdout: "ignore", stderr: "pipe" });
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited, stderr).toBe(0);
+  } finally {
+    if (child?.exitCode === null) child.kill();
+    if (child) await child.exited;
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 // Contract: archive retention uses each trace row's completion time, not the archive mtime.

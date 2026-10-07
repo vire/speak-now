@@ -2,6 +2,11 @@ import { appLogger } from "./logging";
 import { appTracer } from "./tracing";
 import { createErrorReporter } from "./errors";
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { Cause, Deferred, Effect, Exit, FiberSet } from "effect";
+import { leaseDurationMs, maxAttempts, openStorage, type IngestBatch, type JobCompletion, type ListeningSelection, type Storage } from "./storage";
+import { validateSummary } from "./summarizer";
+import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson } from "./shared";
 
 const port = Number(Bun.env.PORT ?? 3000);
 const dataDir = Bun.env.SPEAK_NOW_DATA_DIR ?? "data";
@@ -9,20 +14,362 @@ const logger = appLogger({ dataDirectory: dataDir });
 const tracer = appTracer({ dataDirectory: dataDir });
 const errors = createErrorReporter({ dataDirectory: dataDir });
 const clientErrorLimit = 8_192;
+const collectorBodyLimit = COLLECTOR_WIRE_LIMITS.requestBytes;
+const collectorToken = Bun.env.SPEAK_NOW_COLLECTOR_TOKEN;
 const traceContext = (value: string | string[] | undefined) => {
   const match = (Array.isArray(value) ? value[0] : value ?? "").match(/^00-([a-f0-9]{32})-([a-f0-9]{16})-[a-f0-9]{2}$/i);
   return match ? { traceId: match[1], spanId: match[2] } : undefined;
 };
 
 const json = (response: import("node:http").ServerResponse, status: number, value: unknown) => { response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); response.end(JSON.stringify(value)); };
-createServer(async (request, response) => {
-  const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`); const path = url.pathname;
-  if (path === "/api/health") return json(response, 200, { status: "ok" });
+const respond = (response: import("node:http").ServerResponse, status: number, value: unknown) => Effect.sync(() => json(response, status, value));
+
+type CollectorBody = { kind: "json"; value: unknown } | { kind: "invalid" } | { kind: "too_large" };
+
+const collectorResponse = (response: import("node:http").ServerResponse, status: number, code: string) => json(response, status, { code });
+const collectorRespond = (response: import("node:http").ServerResponse, status: number, code: string) => respond(response, status, { code });
+const collectorJson = (response: import("node:http").ServerResponse, status: number, value: unknown) => Effect.sync(() => {
+  const encoded = encodeCollectorJson(value);
+  if (collectorUtf8Bytes(encoded) > COLLECTOR_WIRE_LIMITS.responseBytes) return collectorResponse(response, 500, "response_too_large");
+  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  response.end(encoded);
+});
+
+const matchesCollectorToken = (authorization: string | undefined) => {
+  if (!collectorToken) return false;
+  const expected = Buffer.from(`Bearer ${collectorToken}`);
+  const actual = Buffer.from(authorization ?? "");
+  const width = Math.max(expected.length, actual.length);
+  const left = Buffer.alloc(width);
+  const right = Buffer.alloc(width);
+  expected.copy(left);
+  actual.copy(right);
+  return timingSafeEqual(left, right) && expected.length === actual.length;
+};
+
+const readJson = (request: import("node:http").IncomingMessage, limit: number = collectorBodyLimit) => {
+  return Effect.callback<CollectorBody>((resume, signal) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const cleanup = () => {
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("error", onError);
+      request.off("aborted", onAborted);
+      signal.removeEventListener("abort", onAborted);
+    };
+    const finish = (result: CollectorBody, drain = false) => {
+      if (settled) return;
+      settled = true;
+      if (drain) {
+        signal.removeEventListener("abort", onAborted);
+        resume(Effect.succeed(result));
+        return;
+      }
+      cleanup();
+      resume(Effect.succeed(result));
+    };
+    const onData = (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > limit) {
+        request.resume();
+        finish({ kind: "too_large" }, true);
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    };
+    const onEnd = () => {
+      if (settled) { cleanup(); return; }
+      try {
+        finish({ kind: "json", value: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      } catch {
+        finish({ kind: "invalid" });
+      }
+    };
+    const onError = () => finish({ kind: "invalid" });
+    const onAborted = () => finish({ kind: "invalid" });
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("error", onError);
+    request.once("aborted", onAborted);
+    signal.addEventListener("abort", onAborted, { once: true });
+    return Effect.sync(cleanup);
+  });
+};
+
+const readCollectorJson = (request: import("node:http").IncomingMessage) => request.headers["content-type"] === "application/json" ? readJson(request) : Effect.succeed<CollectorBody>({ kind: "invalid" });
+
+const record = (value: unknown): Record<string, unknown> | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const text = (value: unknown, limit = 512) => typeof value === "string" && value.length > 0 && value.length <= limit;
+const bounded = (value: unknown, limit = 512) => typeof value === "string" && value.length <= limit;
+const collectorText = (value: unknown, limit: number, required = true) => typeof value === "string" && (!required || value.length > 0) && collectorUtf8Bytes(value) <= limit;
+const exactKeys = (value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []) => required.every((key) => key in value) && Object.keys(value).every((key) => required.includes(key) || optional.includes(key));
+const nonnegativeInteger = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const timestamp = (value: unknown): value is string => typeof value === "string" && text(value, 64) && Number.isFinite(Date.parse(value));
+const trace = (value: unknown) => {
+  const entry = record(value);
+  if (!entry || !exactKeys(entry, ["traceId", "spanId"], ["parentSpanId", "sourceId", "participantId", "jobId", "announcementId", "clipId"])) return false;
+  return typeof entry.traceId === "string" && /^[a-f0-9]{32}$/i.test(entry.traceId) && typeof entry.spanId === "string" && /^[a-f0-9]{16}$/i.test(entry.spanId)
+    && (entry.parentSpanId === undefined || typeof entry.parentSpanId === "string" && /^[a-f0-9]{16}$/i.test(entry.parentSpanId))
+    && [entry.sourceId, entry.participantId, entry.jobId, entry.announcementId, entry.clipId].every((id) => id === undefined || text(id));
+};
+const hasForbiddenField = (value: unknown): boolean => {
+  if (Array.isArray(value)) return value.some(hasForbiddenField);
+  const entry = record(value); if (!entry) return false;
+  return Object.entries(entry).some(([key, child]) => ["command", "path", "filepath", "argv", "shell"].includes(key.toLowerCase()) || hasForbiddenField(child));
+};
+const isCollectorBatchShape = (value: unknown): value is IngestBatch => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  if (hasForbiddenField(body)) return false;
+  if (!exactKeys(body, ["sourceId", "sourceEpoch", "batchId", "listeningGeneration", "topologySequence", "topology", "baselineReady", "cursors", "activities"]) || !text(body.sourceId) || !text(body.sourceEpoch) || !text(body.batchId) || !nonnegativeInteger(body.listeningGeneration) || !nonnegativeInteger(body.topologySequence) || body.topologySequence === 0
+    || !Array.isArray(body.baselineReady) || !Array.isArray(body.cursors) || !Array.isArray(body.activities) || body.baselineReady.length > COLLECTOR_WIRE_LIMITS.maxArrayItems || body.cursors.length > COLLECTOR_WIRE_LIMITS.maxArrayItems || body.activities.length > COLLECTOR_WIRE_LIMITS.maxArrayItems) return false;
+  const topology = record(body.topology);
+  if (!topology || !record(topology.source) || !Array.isArray(topology.workspaces) || !Array.isArray(topology.tabs) || !Array.isArray(topology.panes) || !Array.isArray(topology.participants) || [topology.workspaces, topology.tabs, topology.panes, topology.participants].some((items) => items.length > COLLECTOR_WIRE_LIMITS.maxArrayItems)) return false;
+  const source = topology.source as Record<string, unknown>;
+  if (!exactKeys(topology, ["source", "workspaces", "tabs", "panes", "participants"]) || !exactKeys(source, ["id", "namespace", "stale", "observedAt"]) || source.id !== body.sourceId || !text(source.namespace, 128) || typeof source.stale !== "boolean" || !timestamp(source.observedAt)) return false;
+  const ids = (items: unknown[]): string[] | undefined => {
+    const values: string[] = [];
+    for (const item of items) { const entry = record(item); const id = entry?.id; if (!entry || !text(id)) return undefined; values.push(id as string); }
+    return values;
+  };
+  const workspaceIds = ids(topology.workspaces); const tabIds = ids(topology.tabs); const paneIds = ids(topology.panes); const participantIds = ids(topology.participants);
+  const prefix = `${source.namespace}:`;
+  if (!workspaceIds || !tabIds || !paneIds || !participantIds || ![source.id, ...workspaceIds, ...tabIds, ...paneIds, ...participantIds].every((id) => typeof id === "string" && id.startsWith(prefix)) || ![workspaceIds, tabIds, paneIds, participantIds].every((items) => new Set(items).size === items.length)) return false;
+  if (topology.workspaces.some((item) => { const workspace = record(item); return !workspace || !exactKeys(workspace, ["id", "sourceId", "label", "order", "live"]) || workspace.sourceId !== body.sourceId || !bounded(workspace.label) || !nonnegativeInteger(workspace.order) || typeof workspace.live !== "boolean"; })
+    || topology.tabs.some((item) => { const tab = record(item); return !tab || !exactKeys(tab, ["id", "workspaceId", "label", "order"]) || !workspaceIds.includes(tab.workspaceId as string) || !bounded(tab.label) || !nonnegativeInteger(tab.order); })
+    || topology.panes.some((item) => { const pane = record(item); return !pane || !exactKeys(pane, ["id", "tabId", "terminalId"], ["cwd", "label"]) || !tabIds.includes(pane.tabId as string) || !text(pane.terminalId) || (pane.cwd !== undefined && !bounded(pane.cwd)) || (pane.label !== undefined && !bounded(pane.label)); })
+    || topology.participants.some((item) => { const participant = record(item); return !participant || !exactKeys(participant, ["id", "sourceId", "paneId", "rawPaneId", "terminalId", "kind", "generation", "active"], ["sessionId", "sessionReferenceKind", "sessionReferenceSource"]) || participant.sourceId !== body.sourceId || !paneIds.includes(participant.paneId as string) || !text(participant.rawPaneId) || !text(participant.terminalId) || typeof participant.kind !== "string" || !["claude", "codex", "terminal", "unsupported"].includes(participant.kind) || !nonnegativeInteger(participant.generation) || typeof participant.active !== "boolean" || [participant.sessionId, participant.sessionReferenceKind, participant.sessionReferenceSource].some((field) => field !== undefined && !text(field)); })) return false;
+  const cursorIds = body.cursors.map((item) => record(item)?.participantId).filter((id): id is string => typeof id === "string");
+  if (!body.baselineReady.every((id) => typeof id === "string" && text(id) && participantIds.includes(id) && cursorIds.includes(id)) || new Set(body.baselineReady).size !== body.baselineReady.length || new Set(cursorIds).size !== body.cursors.length || !body.cursors.every((item) => { const cursor = record(item); return cursor && exactKeys(cursor, ["participantId", "previous", "next"]) && typeof cursor.participantId === "string" && text(cursor.participantId) && (cursor.previous === null || collectorText(cursor.previous, COLLECTOR_WIRE_LIMITS.cursorTokenBytes, false)) && collectorText(cursor.next, COLLECTOR_WIRE_LIMITS.cursorTokenBytes, false); }) || !body.activities.every((item) => { const activity = record(item); const emptyGap = activity?.text === "" && (activity.kind === "lifecycle" || activity.status === "gap"); return activity && exactKeys(activity, ["id", "participantId", "sourceCursor", "observedAt", "kind", "text", "captureMode", "status", "truncated", "excerpt", "originalTextBytes"], ["stableMessageId", "revisionId", "revisionOf", "trace"]) && typeof activity.participantId === "string" && text(activity.id) && text(activity.participantId) && participantIds.includes(activity.participantId) && text(activity.sourceCursor) && timestamp(activity.observedAt) && typeof activity.kind === "string" && ["assistant", "tool", "lifecycle", "unknown"].includes(activity.kind) && typeof activity.captureMode === "string" && ["structured", "terminal"].includes(activity.captureMode) && typeof activity.status === "string" && ["complete", "partial", "gap", "limited"].includes(activity.status) && typeof activity.truncated === "boolean" && typeof activity.excerpt === "string" && ["full", "tail"].includes(activity.excerpt) && nonnegativeInteger(activity.originalTextBytes) && [activity.stableMessageId, activity.revisionId, activity.revisionOf].every((id) => id === undefined || text(id)) && (activity.trace === undefined || trace(activity.trace)) && (collectorText(activity.text, COLLECTOR_WIRE_LIMITS.activityTextBytes) || (emptyGap && collectorText(activity.text, COLLECTOR_WIRE_LIMITS.activityTextBytes, false))); })) return false;
+  return true;
+};
+
+const collectorIdentity = (value: unknown): { body: Record<string, unknown>; sourceId: string; sourceEpoch: string; batchId: string } | undefined => {
+  const body = record(value);
+  const sourceId = body?.sourceId;
+  const sourceEpoch = body?.sourceEpoch;
+  const batchId = body?.batchId;
+  return body && text(sourceId) && text(sourceEpoch) && text(batchId)
+    ? { body, sourceId: sourceId as string, sourceEpoch: sourceEpoch as string, batchId: batchId as string }
+    : undefined;
+};
+
+const isListeningSelection = (value: unknown) => {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const selection = value as Record<string, unknown>;
+  const workspace = Object.hasOwn(selection, "workspaceId");
+  const tab = Object.hasOwn(selection, "tabId");
+  return exactKeys(selection, ["sourceId"], ["workspaceId", "tabId"]) && text(selection.sourceId) && workspace !== tab && (!workspace || text(selection.workspaceId)) && (!tab || text(selection.tabId));
+};
+
+const validatedCompletion = (value: unknown): JobCompletion | undefined => {
+  const completion = record(value);
+  const result = completion && record(completion.result);
+  if (!completion || !result || !exactKeys(completion, ["leaseToken", "resultKey", "result"]) || !text(completion.leaseToken) || !text(completion.resultKey) || !Array.isArray(result.evidenceEventIds) || !result.evidenceEventIds.every((id) => text(id))) return undefined;
+  try { return { leaseToken: completion.leaseToken as string, resultKey: completion.resultKey as string, result: validateSummary(result, result.evidenceEventIds as string[]) }; } catch { return undefined; }
+};
+
+const sameOrigin = (request: import("node:http").IncomingMessage) => request.headers.origin === undefined || request.headers.origin === `http://${request.headers.host}`;
+
+const isEventSequence = (value: string | undefined) => value === undefined || (/^(0|[1-9][0-9]*)$/.test(value) && Number.isSafeInteger(Number(value)));
+
+const isWorkerClaim = (value: unknown) => {
+  const body = record(value);
+  return !!body && exactKeys(body, ["workerId"]) && !hasForbiddenField(body) && text(body.workerId, 128);
+};
+
+const validHistoryQuery = (url: URL) => {
+  const limit = url.searchParams.get("limit");
+  const cursor = url.searchParams.get("cursor");
+  return (limit === null || (/^(?:[1-9][0-9]?|100)$/.test(limit))) && (cursor === null || (/^(0|[1-9][0-9]*)$/.test(cursor) && Number.isSafeInteger(Number(cursor))));
+};
+
+type StorageResult<A> = { ok: true; value: A } | { ok: false; cancelled?: boolean };
+
+interface StorageDiagnostic { operation: string; trace?: ReturnType<typeof traceContext>; sourceId?: string; participantId?: string; jobId?: string; operationId?: string; }
+
+const ignoredPromise = (run: () => Promise<unknown>) => Effect.uninterruptible(Effect.ignore(Effect.tryPromise({ try: run, catch: () => undefined })));
+
+const runStorage = <A>(effect: Effect.Effect<A, unknown>, diagnostic: StorageDiagnostic): Effect.Effect<StorageResult<A>> => {
+  const trace = { ...diagnostic.trace, ...(diagnostic.sourceId ? { sourceId: diagnostic.sourceId } : {}), ...(diagnostic.participantId ? { participantId: diagnostic.participantId } : {}), ...(diagnostic.jobId ? { jobId: diagnostic.jobId } : {}) };
+  const span = tracer.start(diagnostic.operation, trace);
+  return effect.pipe(Effect.matchCauseEffect({
+    onSuccess: (value) => ignoredPromise(() => span.end("succeeded")).pipe(Effect.as({ ok: true as const, value })),
+    onFailure: (cause) => Cause.hasInterruptsOnly(cause)
+      ? ignoredPromise(() => span.end("cancelled")).pipe(Effect.as({ ok: false as const, cancelled: true }))
+      : Effect.uninterruptible(Effect.gen(function*() {
+        yield* ignoredPromise(() => span.end("failed"));
+        yield* ignoredPromise(() => logger.log("error", { operation: diagnostic.operation, message: "Durable storage request failed", outcome: "failed", sourceId: diagnostic.sourceId, participantId: diagnostic.participantId, jobId: diagnostic.jobId, traceId: span.context.traceId, spanId: span.context.spanId, metadata: diagnostic.operationId ? { operationId: diagnostic.operationId } : undefined }));
+        yield* ignoredPromise(() => errors.report({ service: "app", operation: diagnostic.operation, category: "storage", error: new Error("Durable storage request failed"), trace: span.context, context: diagnostic.operationId ? { operationId: diagnostic.operationId } : undefined }));
+        return { ok: false as const };
+      })),
+  }));
+};
+
+const storageOrError = <A>(response: import("node:http").ServerResponse, effect: Effect.Effect<A, unknown>, diagnostic: StorageDiagnostic): Effect.Effect<A | undefined> => Effect.gen(function*() {
+  const result = yield* runStorage(effect, diagnostic);
+  if (!result.ok) { yield* collectorRespond(response, 500, "storage_failed"); return undefined; }
+  return result.value;
+});
+
+const handleCollector = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, path: string, url: URL): Effect.Effect<void> => Effect.gen(function*() {
+  if (!collectorToken) return yield* collectorRespond(response, 503, "collector_unavailable");
+  if (!matchesCollectorToken(request.headers.authorization)) return yield* collectorRespond(response, 401, "unauthorized");
+  if (path === "/api/collector/batches" && request.method === "POST") {
+    const body = yield* readCollectorJson(request);
+    if (body.kind === "too_large") return yield* collectorRespond(response, 413, "request_too_large");
+    const identity = body.kind === "json" ? collectorIdentity(body.value) : undefined;
+    if (!identity) return yield* collectorRespond(response, 400, "invalid_request");
+    const prior = yield* storageOrError(response, storage.lookupBatchReceipt({ sourceId: identity.sourceId as IngestBatch["sourceId"], sourceEpoch: identity.sourceEpoch, batchId: identity.batchId, payload: identity.body }), { operation: "server.collector.receipt_lookup", trace: traceContext(request.headers.traceparent), sourceId: identity.sourceId, operationId: identity.batchId });
+    if (!prior) return;
+    if (prior.kind === "conflict") return yield* collectorRespond(response, 409, prior.code);
+    if (prior.kind === "duplicate") return yield* collectorJson(response, 200, prior.receipt);
+    if (!isCollectorBatchShape(identity.body)) return yield* collectorRespond(response, 400, "invalid_request");
+    if (collectorUtf8Bytes(encodeCollectorJson(identity.body.topology)) > COLLECTOR_WIRE_LIMITS.topologyBytes) return yield* collectorRespond(response, 413, "request_too_large");
+    const batch = identity.body;
+    const outcome = yield* storageOrError(response, storage.ingestBatch(batch), { operation: "server.collector.ingest", trace: traceContext(request.headers.traceparent), sourceId: batch.sourceId, operationId: batch.batchId });
+    if (!outcome) return;
+    if (outcome.kind === "conflict") return yield* collectorRespond(response, 409, outcome.code);
+    return yield* collectorJson(response, outcome.kind === "accepted" ? 201 : 200, outcome.receipt);
+  }
+  if (path === "/api/collector/jobs/claim" && request.method === "POST") {
+    const body = yield* readCollectorJson(request);
+    if (body.kind === "too_large") return yield* collectorRespond(response, 413, "request_too_large");
+    if (body.kind !== "json" || !isWorkerClaim(body.value)) return yield* collectorRespond(response, 400, "invalid_request");
+    const outcome = yield* storageOrError(response, storage.claimJob((body.value as { workerId: string }).workerId), { operation: "server.collector.claim" });
+    if (!outcome) return;
+    return outcome.kind === "empty" ? yield* Effect.sync(() => response.writeHead(204).end()) : yield* collectorJson(response, 200, { ...outcome.job, jobId: outcome.job.id });
+  }
+  const resultMatch = path.match(/^\/api\/collector\/jobs\/([A-Za-z0-9:_-]{1,256})\/result$/);
+  if (resultMatch && request.method === "POST") {
+    const body = yield* readCollectorJson(request);
+    const completion = body.kind === "json" ? validatedCompletion(body.value) : undefined;
+    if (body.kind === "too_large") return yield* collectorRespond(response, 413, "request_too_large");
+    if (!completion) return yield* collectorRespond(response, 400, "invalid_request");
+    const outcome = yield* storageOrError(response, storage.completeJob(resultMatch[1], completion), { operation: "server.collector.complete", jobId: resultMatch[1], operationId: resultMatch[1] });
+    if (!outcome) return;
+    if (outcome.kind === "missing") return yield* collectorRespond(response, 404, "not_found");
+    if (outcome.kind === "conflict") return yield* collectorRespond(response, 409, outcome.code);
+    return yield* collectorJson(response, outcome.kind === "accepted" ? 201 : 200, outcome.receipt);
+  }
+  if (path === "/api/collector/config" && request.method === "GET") {
+    const sourceId = url.searchParams.get("sourceId"); if (!text(sourceId)) return yield* collectorRespond(response, 400, "invalid_request");
+    const state = yield* storageOrError(response, storage.getState(), { operation: "server.collector.config", sourceId: sourceId! }); if (!state) return;
+    const source = state.sources.find((item) => item.sourceId === sourceId); if (!source) return yield* collectorRespond(response, 404, "not_found");
+    return yield* collectorJson(response, 200, { sourceId, listeningScope: state.scope?.sourceId === sourceId ? state.scope : null, listeningGeneration: source.listeningGeneration, freshness: { observedAt: source.observedAt, stale: source.stale, topologySequence: source.topologySequence }, worker: { leaseDurationMs, maxAttempts } });
+  }
+  return yield* collectorRespond(response, 404, "not_found");
+});
+
+const handleListening = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  if (!sameOrigin(request)) return yield* collectorRespond(response, 403, "origin_forbidden");
+  const body = yield* readCollectorJson(request);
+  if (body.kind === "too_large") return yield* collectorRespond(response, 413, "request_too_large");
+  if (body.kind !== "json" || !isListeningSelection(body.value)) return yield* collectorRespond(response, 400, "invalid_request");
+  const outcome = yield* storageOrError(response, storage.setListeningScope(body.value as ListeningSelection), { operation: "server.listening", sourceId: (body.value as { sourceId?: string } | null)?.sourceId });
+  if (!outcome) return;
+  return outcome.kind === "unknown" ? yield* collectorRespond(response, 404, outcome.code) : yield* respond(response, 200, { scope: outcome.scope, generation: outcome.generation });
+});
+
+const handleEvents = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  const lastEventId = Array.isArray(request.headers["last-event-id"]) ? request.headers["last-event-id"][0] : request.headers["last-event-id"];
+  if (!isEventSequence(lastEventId)) return yield* collectorRespond(response, 400, "invalid_request");
+  let cursor = Number(lastEventId ?? "0");
+  const initial = yield* runStorage(storage.getEventsSince(cursor), { operation: "server.events" });
+  if (!initial.ok) return yield* collectorRespond(response, 500, "storage_failed");
+  const first = initial.value;
+  if (first.kind === "expired") return yield* collectorRespond(response, 410, "events_expired");
+  if (cursor > first.latestSequence) return yield* collectorRespond(response, 400, "invalid_request");
+  yield* Effect.sync(() => response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive" }));
+  const writable = () => !response.writableEnded && !response.destroyed;
+  const storageFailure = () => { if (writable()) { response.write("event: error\ndata: {\"code\":\"storage_failed\"}\n\n"); response.end(); } };
+  let page = first;
+  while (writable()) {
+    for (const event of page.events) {
+      if (!writable()) return;
+      yield* Effect.sync(() => response.write(`id: ${event.sequence}\nevent: ${event.kind}\ndata: ${JSON.stringify(event.value)}\n\n`));
+      cursor = event.sequence;
+    }
+    if (cursor < page.latestSequence) {
+      if (!writable()) return;
+      const next = yield* runStorage(storage.getEventsSince(cursor), { operation: "server.events" });
+      if (!next.ok) { if (!next.cancelled) yield* Effect.sync(storageFailure); return; }
+      if (next.value.kind === "expired") return;
+      page = next.value; continue;
+    }
+    yield* Effect.sleep(100);
+    if (!writable()) return;
+    const next = yield* runStorage(storage.getEventsSince(cursor), { operation: "server.events" });
+    if (!next.ok) { if (!next.cancelled) yield* Effect.sync(storageFailure); return; }
+    if (next.value.kind === "expired") return;
+    page = next.value;
+  }
+});
+
+const handleHistory = (storage: Storage, url: URL, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  if (!validHistoryQuery(url)) return yield* collectorRespond(response, 400, "invalid_request");
+  const outcome = yield* storageOrError(response, storage.getHistory({ ...(url.searchParams.get("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}), ...(url.searchParams.get("limit") ? { limit: Number(url.searchParams.get("limit")) } : {}) }), { operation: "server.history" });
+  if (outcome) yield* respond(response, 200, outcome);
+});
+
+const handleClientErrors = (request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  const origin = `http://${request.headers.host}`;
+  if (request.headers.origin !== origin) return yield* Effect.sync(() => { response.writeHead(403); response.end("Origin forbidden"); });
+  if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") return yield* Effect.sync(() => { response.writeHead(415); response.end("JSON required"); });
+  if (Number(request.headers["content-length"]) > clientErrorLimit) return yield* Effect.sync(() => { response.writeHead(413); response.end("Request too large"); });
+  const body = yield* readJson(request, clientErrorLimit);
+  if (body.kind === "too_large") return yield* Effect.sync(() => { response.writeHead(413, { Connection: "close" }); response.end("Request too large"); });
+  const value = body.kind === "json" && record(body.value);
+  if (!value) return yield* Effect.sync(() => { response.writeHead(400); response.end("Invalid error report"); });
+  const string = (key: string, limit: number, required = false) => typeof value[key] === "string" && value[key].length > 0 && value[key].length <= limit ? value[key] : required ? undefined : value[key] === undefined ? undefined : null;
+  const operation = string("operation", 120, true); const category = string("category", 80, true); const message = string("message", 1_024, true); const stack = string("stack", 2_048); const sourceId = string("sourceId", 128); const participantId = string("participantId", 128); const jobId = string("jobId", 128); const traceId = string("traceId", 32); const spanId = string("spanId", 16);
+  if (!operation || !category || !message || [stack, sourceId, participantId, jobId, traceId, spanId].includes(null) || Boolean(traceId) !== Boolean(spanId) || (traceId && !/^[a-f0-9]{32}$/i.test(traceId)) || (spanId && !/^[a-f0-9]{16}$/i.test(spanId)) || (value.context !== undefined && (!value.context || typeof value.context !== "object" || Array.isArray(value.context)))) return yield* Effect.sync(() => { response.writeHead(400); response.end("Invalid error report"); });
+  const reportId = yield* Effect.uninterruptible(Effect.tryPromise({
+    try: () => errors.report({ service: "app", operation, category, error: new Error(message), stack: stack ?? undefined, trace: { ...(traceId && spanId ? { traceId, spanId } : {}), ...(sourceId ? { sourceId } : {}), ...(participantId ? { participantId } : {}), ...(jobId ? { jobId } : {}) }, context: value.context as Record<string, unknown> | undefined }),
+    catch: (cause) => cause,
+  })).pipe(Effect.matchEffect({ onFailure: () => Effect.succeed(undefined), onSuccess: (value) => Effect.succeed(value) }));
+  if (!reportId) return yield* Effect.sync(() => { response.writeHead(500); response.end("Unavailable"); });
+  yield* respond(response, 202, { reportId });
+});
+
+const apiRequest = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, path: string, url: URL): Effect.Effect<void> | undefined => {
+  if (path === "/api/health") return respond(response, 200, { status: "ok" });
+  if (path.startsWith("/api/collector/")) return handleCollector(storage, request, response, path, url);
+  if (path === "/api/listening" && request.method === "PUT") return handleListening(storage, request, response);
+  if (path === "/api/state" && request.method === "GET") return Effect.gen(function*() { const state = yield* storageOrError(response, storage.getState(), { operation: "server.state" }); if (state) yield* respond(response, 200, state); });
+  if (path === "/api/events" && request.method === "GET") return handleEvents(storage, request, response);
+  if (path === "/api/history" && request.method === "GET") return handleHistory(storage, url, response);
+  if (path === "/api/client-errors" && request.method === "POST") return handleClientErrors(request, response);
+  return undefined;
+};
+
+const requestProgram = (route: Effect.Effect<void>, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse) => Effect.gen(function*() {
+  const disconnected = yield* Deferred.make<void>();
+  const disconnect = () => { Deferred.doneUnsafe(disconnected, Effect.void); };
+  return yield* Effect.acquireUseRelease(
+    Effect.sync(() => {
+      request.once("aborted", disconnect);
+      request.socket.once("close", disconnect);
+      response.once("close", disconnect);
+      if (request.destroyed || response.destroyed) disconnect();
+    }),
+    () => Effect.raceFirst(route, Deferred.await(disconnected).pipe(Effect.andThen(Effect.interrupt))),
+    (_, exit) => Effect.sync(() => {
+      request.off("aborted", disconnect);
+      request.socket.off("close", disconnect);
+      response.off("close", disconnect);
+      if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) && !response.writableEnded) response.destroy();
+    }),
+  );
+});
+
+const handleLegacy = async (request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, path: string, url: URL) => {
   if (path === "/api/hello") return json(response, 200, { message: "Hello from Speak Now!" });
   if (path === "/api/config") return json(response, 200, {
-      collector: "bun src/collector.ts",
       liveSpeechConfigured: Boolean(Bun.env.ELEVENLABS_API_KEY && Bun.env.ELEVENLABS_VOICE_ID),
-      dataDir,
       diagnostics: logger.getStatus(),
       traces: tracer.getStatus(),
       errors: errors.getStatus(),
@@ -41,27 +388,89 @@ createServer(async (request, response) => {
     const span = tracer.start("media.read", { ...traceContext(request.headers.traceparent ?? url.searchParams.get("traceparent") ?? undefined), clipId: audio[1] });
     try { const file = Bun.file(`${dataDir}/audio/${audio[1]}.mp3`); const exists = await file.exists(); if (!exists) { await span.end("missing"); void logger.log("warn", { operation: "server.media", message: "Audio clip unavailable", outcome: "missing", metadata: { clip: audio[1] } }); response.writeHead(404); return response.end("Audio unavailable"); } const bytes = await file.arrayBuffer(); await span.end("succeeded"); void logger.log("info", { operation: "server.media", message: "Served audio clip", outcome: "succeeded", metadata: { clip: audio[1] } }); response.writeHead(200, { "Content-Type": "audio/mpeg", "Cache-Control": "no-store" }); return response.end(bytes); } catch { await span.end("failed"); response.writeHead(500); return response.end("Audio unavailable"); }
   }
-  if (path === "/api/client-errors" && request.method === "POST") {
-    const origin = `http://${request.headers.host}`;
-    if (request.headers.origin !== origin) { response.writeHead(403); return response.end("Origin forbidden"); }
-    if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") { response.writeHead(415); return response.end("JSON required"); }
-    if (Number(request.headers["content-length"]) > clientErrorLimit) { response.writeHead(413); return response.end("Request too large"); }
-    const chunks: Buffer[] = []; let bytes = 0; let overflow = false;
-    request.on("data", (chunk: Buffer) => { bytes += chunk.length; if (bytes > clientErrorLimit && !overflow) { overflow = true; response.writeHead(413, { Connection: "close" }); response.end("Request too large"); request.resume(); } else if (!overflow) chunks.push(Buffer.from(chunk)); });
-    request.on("end", async () => {
-      if (overflow) return;
-      let body: unknown;
-      try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { response.writeHead(400); return response.end("Invalid JSON"); }
-        if (!body || typeof body !== "object" || Array.isArray(body)) { response.writeHead(400); return response.end("Invalid error report"); }
-        const value = body as Record<string, unknown>;
-        const string = (key: string, limit: number, required = false) => typeof value[key] === "string" && value[key].length > 0 && value[key].length <= limit ? value[key] : required ? undefined : value[key] === undefined ? undefined : null;
-        const operation = string("operation", 120, true); const category = string("category", 80, true); const message = string("message", 1_024, true); const stack = string("stack", 2_048); const sourceId = string("sourceId", 128); const participantId = string("participantId", 128); const jobId = string("jobId", 128); const traceId = string("traceId", 32); const spanId = string("spanId", 16);
-        if (!operation || !category || !message || [stack, sourceId, participantId, jobId, traceId, spanId].includes(null) || Boolean(traceId) !== Boolean(spanId) || (traceId && !/^[a-f0-9]{32}$/i.test(traceId)) || (spanId && !/^[a-f0-9]{16}$/i.test(spanId)) || (value.context !== undefined && (!value.context || typeof value.context !== "object" || Array.isArray(value.context)))) { response.writeHead(400); return response.end("Invalid error report"); }
-        const reportId = await errors.report({ service: "app", operation, category, error: new Error(message), stack: stack ?? undefined, trace: { ...(traceId && spanId ? { traceId, spanId } : {}), ...(sourceId ? { sourceId } : {}), ...(participantId ? { participantId } : {}), ...(jobId ? { jobId } : {}) }, context: value.context as Record<string, unknown> | undefined });
-        return json(response, 202, { reportId });
-    });
-    return;
-  }
   response.writeHead(404); response.end("Not found");
-}).listen(port);
-console.log(`Speak Now is running at http://localhost:${port}`);
+};
+
+const createApp = (storage: Storage, dispatch: <A>(effect: Effect.Effect<A>) => unknown, admission: { open: boolean }) => createServer((request, response) => {
+  const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`); const path = url.pathname;
+  if (!admission.open) { response.destroy(); return; }
+  const route = apiRequest(storage, request, response, path, url);
+  const program = route ?? Effect.uninterruptible(Effect.tryPromise({ try: () => handleLegacy(request, response, path, url), catch: (cause) => cause })).pipe(Effect.matchEffect({ onFailure: () => Effect.sync(() => { if (!response.headersSent) { response.writeHead(500); response.end("Unavailable"); } }), onSuccess: () => Effect.void }));
+  dispatch(requestProgram(program, request, response));
+});
+
+const closeRequestServer = (server: ReturnType<typeof createServer>, requests: FiberSet.FiberSet<void, never>, admission: { open: boolean }) => Effect.gen(function*() {
+  const closed = yield* Deferred.make<void, Error>();
+  yield* Effect.sync(() => {
+    admission.open = false;
+    if (!server.listening) { Deferred.doneUnsafe(closed, Effect.void); return; }
+    try {
+      server.close((error) => { Deferred.doneUnsafe(closed, error ? Effect.fail(error) : Effect.void); });
+    } catch (cause) {
+      Deferred.doneUnsafe(closed, Effect.fail(cause instanceof Error ? cause : new Error("Server close failed")));
+    }
+  });
+  yield* FiberSet.clear(requests);
+  yield* Effect.sync(() => server.closeAllConnections?.());
+  yield* Deferred.await(closed);
+});
+
+const listenServer = (server: ReturnType<typeof createServer>) => Effect.callback<void, Error>((resume, signal) => {
+  let settled = false;
+  const cleanup = () => {
+    server.off("listening", onListening);
+    server.off("error", onError);
+    signal.removeEventListener("abort", onAbort);
+  };
+  const settle = (effect: Effect.Effect<void, Error>) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    resume(effect);
+  };
+  const onListening = () => settle(Effect.void);
+  const onError = (cause: Error) => settle(Effect.fail(cause));
+  const onAbort = () => settle(Effect.fail(new Error("Server startup cancelled")));
+  server.once("listening", onListening);
+  server.once("error", onError);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try { server.listen(port); } catch (cause) { settle(Effect.fail(cause instanceof Error ? cause : new Error("Server listen failed"))); }
+  return Effect.sync(() => {
+    cleanup();
+    if (server.listening) server.close();
+  });
+});
+
+const serverProgram = Effect.scoped(Effect.gen(function*() {
+  const storage = yield* openStorage(dataDir);
+  const requests = yield* FiberSet.make<void, never>();
+  const dispatch = yield* FiberSet.runtime(requests)<never>();
+  const admission = { open: true };
+  const server = yield* Effect.acquireRelease(
+    Effect.try({ try: () => createApp(storage, dispatch, admission), catch: (cause) => cause }),
+    (resource) => Effect.ignore(closeRequestServer(resource, requests, admission)),
+  );
+  yield* listenServer(server);
+  yield* Effect.sync(() => console.log(`Speak Now is running at http://localhost:${port}`));
+  yield* Effect.never;
+}));
+
+const terminalServerProgram = serverProgram.pipe(Effect.matchEffect({
+  onFailure: (error) => Effect.tryPromise({
+    try: () => errors.report({ service: "app", operation: "server.start", category: "storage", error }),
+    catch: (cause) => cause,
+  }).pipe(Effect.andThen(Effect.tryPromise({ try: () => errors.flush(), catch: (cause) => cause })), Effect.matchEffect({
+    onFailure: () => Effect.sync(() => { process.exitCode = 1; }),
+    onSuccess: () => Effect.sync(() => { process.exitCode = 1; }),
+  })),
+  onSuccess: () => Effect.void,
+}));
+
+const main = Effect.runFork(terminalServerProgram);
+const shutdown = () => { main.interruptUnsafe(); };
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+main.addObserver(() => {
+  process.off("SIGINT", shutdown);
+  process.off("SIGTERM", shutdown);
+});

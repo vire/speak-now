@@ -1,0 +1,17 @@
+services:
+  app:
+    build:
+      context: .
+    environment:
+      PORT: "3000"
+      SPEAK_NOW_DATA_DIR: /data
+      SPEAK_NOW_COLLECTOR_TOKEN: ${SPEAK_NOW_COLLECTOR_TOKEN:?set SPEAK_NOW_COLLECTOR_TOKEN in the ignored root .env}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - speak-now-data:/data
+    init: true
+    restart: unless-stopped
+
+volumes:
+  speak-now-data:
