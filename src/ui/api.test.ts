@@ -41,7 +41,6 @@ test("browser API encodes opaque IDs and sends each endpoint its own public DTO"
   await expect(api.setListening(null)).resolves.toEqual({ scope: { sourceId, tabId, generation: 3 }, generation: 3 });
 
   expect(requests[0]?.url.searchParams.get("sourceId")).toBe(sourceId);
-  expect(requests[1]?.url.searchParams).toMatchObject({});
   expect(Object.fromEntries(requests[1]!.url.searchParams)).toEqual({ sourceId, tabId, participantId, from: "2026-10-07T10:00:00.000Z", to: "2026-10-07T11:00:00.000Z", order: "desc", limit: "20" });
   expect(requests.slice(2).map(({ init }) => ({ method: init?.method, body: init?.body }))).toEqual([
     { method: "PUT", body: JSON.stringify({ sourceId, tabId }) },

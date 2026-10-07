@@ -226,8 +226,8 @@ test("failed reconciliation keeps scope unresolved and gates Join and Leave unti
   const api: BrowserApi = {
     readState: async (sourceId) => {
       stateReads += 1;
-      if (stateReads === 2) throw new TypeError("reconciliation unavailable");
-      return state(sourceId ?? sourceA, stateReads, stateReads === 3 ? { sourceId: sourceA, workspaceId: "workspace-a", generation: 2 } : null);
+      if (stateReads === 2 || stateReads === 3) throw new TypeError("reconciliation unavailable");
+      return state(sourceId ?? sourceA, stateReads, stateReads === 4 ? { sourceId: sourceA, workspaceId: "workspace-a", generation: 2 } : null);
     },
     readHistory: async () => history(),
     setListening: async () => {
@@ -245,7 +245,11 @@ test("failed reconciliation keeps scope unresolved and gates Join and Leave unti
   await expect(session.joinTab(sourceA, "tab-a")).rejects.toThrow("scope mutation is pending");
   await expect(session.leave()).rejects.toThrow("scope mutation is pending");
 
-  await session.retryScope();
+  await session.start(session.snapshot().selectedSourceId);
+  expect(session.snapshot().scopeStatus).toBe("unresolved");
+  await expect(session.leave()).rejects.toThrow("scope mutation is pending");
+  await session.start(session.snapshot().selectedSourceId);
+  expect(session.snapshot().scopeStatus).toBe("confirmed");
   expect(session.snapshot().confirmedScope).toEqual({ sourceId: sourceA, workspaceId: "workspace-a", generation: 2 });
   await expect(session.leave()).resolves.toBeUndefined();
   session.stop();
@@ -369,12 +373,12 @@ test("an old explicit retry cannot publish after stop and restart", async () => 
   const session = sessionFor(api);
   await session.start(sourceA);
   await expect(session.joinWorkspace(sourceA, "workspace-old")).rejects.toThrow("ambiguous");
-  const retry = session.retryScope();
+  const retry = session.start(session.snapshot().selectedSourceId);
   await eventually(() => expect(reads).toBe(3));
   session.stop();
   await session.start(sourceA);
   retryRead.reject(new TypeError("old retry failed"));
-  await expect(retry).rejects.toThrow("scope reconciliation retired");
+  await retry;
   expect(session.snapshot().confirmedScope).toEqual(newer);
   expect(session.snapshot().scopeStatus).not.toBe("unresolved");
   session.stop();
@@ -461,12 +465,12 @@ test("a superseded retry cannot gate a newer confirmed scope", async () => {
   const session = sessionFor(api);
   await session.start(sourceA);
   await expect(session.joinWorkspace(sourceA, "old-workspace")).rejects.toThrow("ambiguous write");
-  const oldRetry = session.retryScope();
+  const oldRetry = session.start(session.snapshot().selectedSourceId);
   await eventually(() => expect(reads).toBe(3));
-  await session.retryScope();
+  await session.start(session.snapshot().selectedSourceId);
   expect(session.snapshot().scopeStatus).toBe("confirmed");
   oldRead.reject(new TypeError("old read failed"));
-  await expect(oldRetry).rejects.toThrow("scope reconciliation retired");
+  await oldRetry;
   expect(session.snapshot().scopeStatus).toBe("confirmed");
   expect(session.snapshot().confirmedScope).toEqual(scope);
 });

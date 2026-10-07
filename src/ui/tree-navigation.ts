@@ -26,7 +26,6 @@ export const moveTreeFocus = (nodes: TreeNode[], expanded: Set<string>, focusId:
   if (key === "ArrowDown") return { focusId: visible[Math.min(position + 1, visible.length - 1)] ?? focusId, expanded: next };
   if (key === "ArrowUp") return { focusId: visible[Math.max(position - 1, 0)] ?? focusId, expanded: next };
   if (key === "ArrowRight" && node?.children.length) {
-    if (next.has(focusId)) return { focusId: node.children[0].id, expanded: next };
     next.add(focusId);
     return { focusId: node.children[0].id, expanded: next };
   }
@@ -40,8 +39,7 @@ export const moveTreeFocus = (nodes: TreeNode[], expanded: Set<string>, focusId:
   return { focusId, expanded: next };
 };
 
-export const reconcileTreeFocus = (nodes: TreeNode[], focusId: string, expanded: Set<string>, removed?: { removed: string; parent: string }): string => {
+export const reconcileTreeFocus = (nodes: TreeNode[], focusId: string, expanded: Set<string>): string => {
   if (visibleTreeIds(nodes, expanded).includes(focusId)) return focusId;
-  if (removed?.removed === focusId && visibleTreeIds(nodes, expanded).includes(removed.parent)) return removed.parent;
   return visibleTreeIds(nodes, expanded)[0] ?? "";
 };

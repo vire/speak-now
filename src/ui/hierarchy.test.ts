@@ -48,7 +48,6 @@ test("projects complete opaque hierarchy without merging duplicate labels or hid
   const tree = buildHierarchy(selectedState(), now);
 
   expect(tree.sourceId).toBe(sourceA);
-  expect(tree.confirmedScope).toEqual({ sourceId: sourceB, tabId: "tab-other", generation: 2 });
   expect(tree.workspaces.map((workspace) => [workspace.id, workspace.label, workspace.tabs.map((tab) => [tab.id, tab.panes.length])])).toEqual([
     ["workspace-a", "Same", [["tab-empty", 0], ["tab-live", 2]]],
     ["workspace-b", "Same", [["tab-shell", 1]]],

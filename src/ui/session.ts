@@ -106,11 +106,6 @@ export const createBrowserSession = (api: BrowserApi) => {
         for await (const event of events) {
           if (stopped || owner !== streamOwner || controller.signal.aborted) return;
           if (event.id <= (eventCursor ?? cursor)) continue;
-          if (event.id !== (eventCursor ?? cursor) + 1) {
-            await resnapshot();
-            return;
-          }
-          eventCursor = event.id;
           await resnapshot();
           return;
         }
@@ -224,22 +219,6 @@ export const createBrowserSession = (api: BrowserApi) => {
     joinTab: (sourceId: string, tabId: string) => setListening({ sourceId, tabId }),
     leave: () => setListening(null),
     setListening,
-    async retryScope() {
-      if (!scopeUnresolved) return;
-      const retryLifecycle = lifecycle;
-      const retryRead = stateRead + 1;
-      const retryScopeEpoch = scopeEpoch;
-      const reconciled = await resnapshot();
-      if (stopped || retryLifecycle !== lifecycle || retryRead !== stateRead || retryScopeEpoch !== scopeEpoch) throw new Error("scope reconciliation retired");
-      if (!reconciled) {
-        scopeStatus = "unresolved";
-        publish();
-        throw new Error("scope reconciliation failed");
-      }
-      scopeUnresolved = false;
-      scopeStatus = "confirmed";
-      publish();
-    },
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);

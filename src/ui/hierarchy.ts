@@ -5,7 +5,7 @@ export type HierarchyParticipant = { id: string; lifecycle: "Unknown"; verifiedB
 export type HierarchyPane = { id: string; label?: string; cwd?: string; participants: HierarchyParticipant[] };
 export type HierarchyTab = { id: string; label: string; panes: HierarchyPane[] };
 export type HierarchyWorkspace = { id: string; label: string; tabs: HierarchyTab[] };
-export type Hierarchy = { sourceId: string; freshness: "Fresh" | "Stale"; confirmedScope: StateResponse["scope"]; workspaces: HierarchyWorkspace[] };
+export type Hierarchy = { sourceId: string; freshness: "Fresh" | "Stale"; workspaces: HierarchyWorkspace[] };
 
 export const sourceFreshness = (source: { stale: boolean; observedAt: string }, now: number, thresholdMs: number): "Fresh" | "Stale" => {
   const observedAt = Date.parse(source.observedAt);
@@ -27,7 +27,7 @@ export const historyLocation = (capture: { workspace?: { id: string; label: stri
 });
 
 export const buildHierarchy = (state: StateResponse, now = Date.now(), freshnessThresholdMs = 60_000): Hierarchy => {
-  if (!state.topology) return { sourceId: "", freshness: "Stale", confirmedScope: state.scope, workspaces: [] };
+  if (!state.topology) return { sourceId: "", freshness: "Stale", workspaces: [] };
   const { topology } = state;
   const captures = new Map(state.captureByParticipant.map((item) => [item.participantId, item.capture]));
   const participantsFor = (paneId: string): HierarchyParticipant[] => topology.participants
@@ -43,7 +43,6 @@ export const buildHierarchy = (state: StateResponse, now = Date.now(), freshness
   return {
     sourceId: topology.source.id,
     freshness: sourceFreshness(topology.source, now, freshnessThresholdMs),
-    confirmedScope: state.scope,
     workspaces: topology.workspaces.slice().sort((left, right) => left.order - right.order).map((workspace) => ({ id: workspace.id, label: workspace.label, tabs: tabsFor(workspace.id) })),
   };
 };
