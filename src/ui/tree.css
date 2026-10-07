@@ -1,0 +1,14 @@
+body { margin: 0; min-height: 100vh; background: #0b151a; color: #e7f3f5; font: 0.95rem/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 90rem; margin: 0 auto; padding: 1rem; }
+.speak-now-shell { display: grid; grid-template-columns: minmax(16rem, 28rem) 1fr; gap: 1rem; align-items: start; }
+.source-rail, .reading-pane, .prototype-demo, .unavailable-actions { border: 1px solid #49606f; border-radius: .4rem; padding: 1rem; background: #13222a; }
+.source-rail { background: #102d36; }
+.source-rail, .reading-pane, .prototype-demo, .unavailable-actions { color: #e7f3f5; }
+.source-rail button, .reading-pane button, .prototype-demo button, .unavailable-actions button { font: inherit; }
+.speak-now-shell ul { padding-left: 1.1rem; }
+.tree-node { text-align: left; margin: .12rem; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #ffcf4a; outline-offset: 2px; }
+form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; }
+label { display: grid; gap: .15rem; }
+.prototype-demo, .unavailable-actions { margin-top: 1rem; }
+@media (max-width: 44rem) { .speak-now-shell { grid-template-columns: 1fr; } }

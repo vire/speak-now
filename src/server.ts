@@ -4,7 +4,7 @@ import { createErrorReporter } from "./errors";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { Cause, Deferred, Effect, Exit, FiberSet } from "effect";
-import { leaseDurationMs, maxAttempts, openStorage, type IngestBatch, type JobCompletion, type ListeningSelection, type Storage } from "./storage";
+import { leaseDurationMs, maxAttempts, openStorage, type HistoryQuery, type IngestBatch, type JobCompletion, type ListeningSelection, type StateQuery, type Storage } from "./storage";
 import { validateSummary } from "./summarizer";
 import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson } from "./shared";
 
@@ -181,10 +181,46 @@ const isWorkerClaim = (value: unknown) => {
   return !!body && exactKeys(body, ["workerId"]) && !hasForbiddenField(body) && text(body.workerId, 128);
 };
 
+const historyTimestamp = (value: string | undefined) => {
+  if (!value || !text(value, 64)) return undefined;
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/);
+  if (!match) return undefined;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const offset = match[8] === "Z" ? undefined : match[8]?.slice(1).split(":").map(Number);
+  if (!Number.isSafeInteger(year) || month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate() || hour > 23 || minute > 59 || second > 59 || offset && (offset[0]! > 23 || offset[1]! > 59)) return undefined;
+  const instant = Date.parse(value);
+  return Number.isFinite(instant) ? new Date(instant).toISOString() : undefined;
+};
+
 const validHistoryQuery = (url: URL) => {
-  const limit = url.searchParams.get("limit");
-  const cursor = url.searchParams.get("cursor");
-  return (limit === null || (/^(?:[1-9][0-9]?|100)$/.test(limit))) && (cursor === null || (/^(0|[1-9][0-9]*)$/.test(cursor) && Number.isSafeInteger(Number(cursor))));
+  const names = ["sourceId", "workspaceId", "tabId", "participantId", "from", "to", "limit", "cursor", "order"];
+  if (names.some((name) => url.searchParams.getAll(name).length > 1)) return undefined;
+  const one = (name: string) => {
+    const values = url.searchParams.getAll(name);
+    return values[0];
+  };
+  const sourceId = one("sourceId");
+  const workspaceId = one("workspaceId");
+  const tabId = one("tabId");
+  const participantId = one("participantId");
+  const from = one("from");
+  const to = one("to");
+  const limit = one("limit");
+  const cursor = one("cursor");
+  const order = one("order");
+  const canonicalFrom = from === undefined ? undefined : historyTimestamp(from);
+  const canonicalTo = to === undefined ? undefined : historyTimestamp(to);
+  if ([sourceId, workspaceId, tabId, participantId].some((value) => value !== undefined && !text(value))) return undefined;
+  if ((workspaceId !== undefined || tabId !== undefined) && !sourceId || workspaceId !== undefined && tabId !== undefined) return undefined;
+  if (from !== undefined && !canonicalFrom || to !== undefined && !canonicalTo || canonicalFrom !== undefined && canonicalTo !== undefined && canonicalFrom > canonicalTo) return undefined;
+  if (limit !== undefined && !/^(?:[1-9][0-9]?|100)$/.test(limit) || cursor !== undefined && !(/^(0|[1-9][0-9]*)$/.test(cursor) && Number.isSafeInteger(Number(cursor))) || order !== undefined && order !== "asc" && order !== "desc") return undefined;
+  return { ...(sourceId ? { sourceId: sourceId as HistoryQuery["sourceId"] } : {}), ...(workspaceId ? { workspaceId: workspaceId as HistoryQuery["workspaceId"] } : {}), ...(tabId ? { tabId: tabId as HistoryQuery["tabId"] } : {}), ...(participantId ? { participantId: participantId as HistoryQuery["participantId"] } : {}), ...(canonicalFrom ? { from: canonicalFrom } : {}), ...(canonicalTo ? { to: canonicalTo } : {}), ...(limit ? { limit: Number(limit) } : {}), ...(cursor ? { cursor } : {}), ...(order ? { order } : {}) } satisfies HistoryQuery;
+};
+
+const stateQuery = (url: URL): StateQuery | undefined => {
+  const sourceIds = url.searchParams.getAll("sourceId");
+  if (sourceIds.length > 1 || sourceIds[0] !== undefined && !text(sourceIds[0])) return undefined;
+  return sourceIds[0] ? { sourceId: sourceIds[0] as StateQuery["sourceId"] } : {};
 };
 
 type StorageResult<A> = { ok: true; value: A } | { ok: false; cancelled?: boolean };
@@ -310,9 +346,19 @@ const handleEvents = (storage: Storage, request: import("node:http").IncomingMes
 });
 
 const handleHistory = (storage: Storage, url: URL, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
-  if (!validHistoryQuery(url)) return yield* collectorRespond(response, 400, "invalid_request");
-  const outcome = yield* storageOrError(response, storage.getHistory({ ...(url.searchParams.get("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}), ...(url.searchParams.get("limit") ? { limit: Number(url.searchParams.get("limit")) } : {}) }), { operation: "server.history" });
+  const query = validHistoryQuery(url);
+  if (!query) return yield* collectorRespond(response, 400, "invalid_request");
+  const outcome = yield* storageOrError(response, storage.getHistory(query), { operation: "server.history", sourceId: query.sourceId, participantId: query.participantId });
   if (outcome) yield* respond(response, 200, outcome);
+});
+
+const handleState = (storage: Storage, url: URL, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  const query = stateQuery(url);
+  if (!query) return yield* collectorRespond(response, 400, "invalid_request");
+  const state = yield* storageOrError(response, storage.getState(query), { operation: "server.state", sourceId: query.sourceId });
+  if (!state) return;
+  if (query.sourceId && !state.sources.some((source) => source.sourceId === query.sourceId)) return yield* collectorRespond(response, 404, "not_found");
+  yield* respond(response, 200, state);
 });
 
 const handleClientErrors = (request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
@@ -339,7 +385,7 @@ const apiRequest = (storage: Storage, request: import("node:http").IncomingMessa
   if (path === "/api/health") return respond(response, 200, { status: "ok" });
   if (path.startsWith("/api/collector/")) return handleCollector(storage, request, response, path, url);
   if (path === "/api/listening" && request.method === "PUT") return handleListening(storage, request, response);
-  if (path === "/api/state" && request.method === "GET") return Effect.gen(function*() { const state = yield* storageOrError(response, storage.getState(), { operation: "server.state" }); if (state) yield* respond(response, 200, state); });
+  if (path === "/api/state" && request.method === "GET") return handleState(storage, url, response);
   if (path === "/api/events" && request.method === "GET") return handleEvents(storage, request, response);
   if (path === "/api/history" && request.method === "GET") return handleHistory(storage, url, response);
   if (path === "/api/client-errors" && request.method === "POST") return handleClientErrors(request, response);
@@ -377,6 +423,12 @@ const handleLegacy = async (request: import("node:http").IncomingMessage, respon
   if (path === "/assets/client.js" || path === "/") {
     const file = Bun.file(path === "/" ? "public/index.html" : "public/assets/client.js");
     response.writeHead(200, { "Content-Type": path === "/" ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8" });
+    return response.end(await file.arrayBuffer());
+  }
+  if (path === "/assets/client.css") {
+    const file = Bun.file("public/assets/client.css");
+    if (!(await file.exists())) { response.writeHead(404); return response.end("Not found"); }
+    response.writeHead(200, { "Content-Type": "text/css; charset=utf-8" });
     return response.end(await file.arrayBuffer());
   }
   if (path === "/api/prototype/latest") {

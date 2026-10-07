@@ -13,7 +13,7 @@ bun install
 bun run dev
 ```
 
-Open <http://localhost:3000>. The UI calls `GET /api/hello` and displays the response. The development command rebuilds the client once when it starts and watches the server; run `bun run build:client` after editing client code to refresh the browser bundle.
+Open <http://localhost:3000>. The browser shows the current source, workspace, tab, and pane hierarchy and a retained text history feed. Browsing a source or channel only changes the view. **Join** explicitly selects one workspace or tab for listening; **Leave** clears listening without clearing the browsing selection. The development command rebuilds the client once when it starts and watches the server; run `bun run build:client` after editing client code to refresh the browser bundle.
 
 ## Capture loop
 
@@ -49,7 +49,7 @@ Collector envelopes use finite shared limits: 20,000 UTF-8 bytes for activity te
 
 Live speech needs both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`. Audio is written atomically to `data/audio/`. Without both values, the code reports the explicit prerequisite instead of pretending playback occurred.
 
-Open the app and select **Enable audio** once to grant browser playback permission. The page polls only the local prototype announcement endpoint and plays a completed saved MP3 once per clip key.
+The original prototype audio remains available outside joined listening. Select **Enable audio** to grant browser playback permission for that local demo. Pending or uncertain listening changes and joining a workspace or tab suspend prototype playback so a global latest clip cannot sound like scoped audio. Scoped narration, mute, volume, speed, and playback-history controls are SN-08 work. Text **Catch up** is SN-07 work. Controls shown as unavailable in this hierarchy/read milestone do not provide those functions yet.
 
 ## API
 
@@ -66,19 +66,39 @@ Open the app and select **Enable audio** once to grant browser playback permissi
 | `POST /api/collector/jobs/claim` | Authenticated bounded worker job claim, or 204 when no work is available |
 | `POST /api/collector/jobs/:jobId/result` | Authenticated fenced durable job completion |
 | `PUT /api/listening` | Same-origin selection of a known source workspace or tab |
-| `GET /api/state` | Current topology, freshness, scope, job indicators, and durable event sequence |
-| `GET /api/history` | Bounded paginated announcement and completion history |
+| `GET /api/state?sourceId=...` | Read one source topology, all source metadata, confirmed listening scope, capture facts, freshness, job indicators, and global event sequence; omitting `sourceId` uses the default source |
+| `GET /api/history` | Captured-context filters and bounded stable pagination for persisted summary results and announcements |
 | `GET /api/events` | Same-origin durable SSE replay and live state/history events |
 
 Set `PORT` to change the listen port (default: `3000`).
 
+`GET /api/state?sourceId=<opaque-id>` is read-only and does not change the listening scope. A duplicate, empty, or malformed `sourceId` returns 400; an unknown source returns 404. `PUT /api/listening` accepts exactly `{ "sourceId": "...", "workspaceId": "..." }`, `{ "sourceId": "...", "tabId": "..." }`, or JSON `null` to leave. Only one scope is active. Its success response is `{ "scope": ..., "generation": ... }`.
+
+History can be queried with `sourceId`, one of `workspaceId` or `tabId`, `participantId`, `from`, `to`, `cursor`, `limit`, and `order=asc|desc`. A workspace or tab filter requires `sourceId`. The default order is ascending; `order=desc` starts with the newest retained results. `from` and `to` are offset-aware ISO timestamps for the job creation time. The server applies stored source, participant, and captured location filters before ordering and pagination, so historical rows remain searchable after a participant moves or exits. For example:
+
+```sh
+curl 'http://localhost:3000/api/history?sourceId=source-1&tabId=tab-1&order=desc&limit=20'
+curl 'http://localhost:3000/api/history?sourceId=source-1&participantId=participant-1&from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00%3A00%3A00Z&order=asc'
+```
+
+Source freshness, last retained capture facts, agent lifecycle, summary completion, and speech/playback are separate facts. An agent's presence does not establish its Working status, and a completed summary does not establish playback. Missing lifecycle and verified repository metadata remain Unknown. Capture facts expire by time even without a new event.
+
 ## Build and run
 
 ```sh
+bun test ./src ./test
 bun run typecheck
 bun run build
 bun run start
 ```
+
+For a browser check against an isolated local database, run:
+
+```sh
+PORT=33106 SPEAK_NOW_DATA_DIR=tmp/sn06-local-data bun run dev
+```
+
+Open <http://localhost:33106>. Once a collector has ingested two sources, browse the second without joining, then use Join and Leave on a known channel. Use the tree with Tab, arrow keys, Enter, and Space, and check that history filters and retry actions remain keyboard reachable. Live speech credentials are not needed for hierarchy and retained-text checks. This port and data directory keep an app already listening on port 3000 untouched.
 
 Trace files are local JSONL files under `data/traces/writer-*/`. Each process owns one unique writer directory; inspect traces by aggregating those files and correlating IDs. `maxRetainedFiles` and `maxFileBytes` apply to each live writer, including its active file and reclaimed archives, so there is no global append order or total-file budget. A live idle writer is reconciled only on its next append. The recorder uses Bun and standard filesystem APIs only. Dead generations are recovered only on the same host and PID namespace after an `ESRCH` liveness result; network filesystems and other platforms are not claimed. Legacy root JSONL migration is quiescent and idempotent: stop older writers before the first generation starts.
 
