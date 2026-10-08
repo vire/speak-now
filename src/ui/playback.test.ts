@@ -129,9 +129,11 @@ test("automatic ready items queue behind one owner instead of interrupting each 
 
 test("scope uncertainty retires queued items before a delayed stopped acknowledgement can drain them", async () => {
   const stopped = deferred<void>();
+  let retryQueuedStop = true;
   const outcomes: string[] = [];
   const owner = createScopedPlaybackOwner({ createAudio: (url) => new FakeAudio(url), report: (event) => {
     outcomes.push(`${event.item.id}:${event.outcome}`);
+    if (event.item.id === "announcement-b" && event.outcome === "stopped" && retryQueuedStop) return Promise.reject(new TypeError("offline"));
     return event.item.id === "announcement-a" && event.outcome === "stopped" ? stopped.promise : undefined;
   } });
   const settings = { master: { muted: false, volume: 1, rate: 1 }, participants: {} };
@@ -146,7 +148,22 @@ test("scope uncertainty retires queued items before a delayed stopped acknowledg
   await Bun.sleep(1);
 
   expect(FakeAudio.instances).toHaveLength(1);
-  expect(outcomes).toEqual(["announcement-a:started", "announcement-a:stopped"]);
+  expect(outcomes).toEqual(["announcement-a:started", "announcement-b:stopped", "announcement-a:stopped"]);
+  retryQueuedStop = false;
+  await owner.retryPendingAcknowledgements();
+  expect(outcomes.filter((outcome) => outcome === "announcement-b:stopped")).toHaveLength(2);
+});
+
+test("disposing the owner terminalizes queued prepared items", async () => {
+  const outcomes: string[] = [];
+  const owner = createScopedPlaybackOwner({ createAudio: (url) => new FakeAudio(url), report: (event) => { outcomes.push(`${event.item.id}:${event.outcome}`); } });
+  owner.sync({ scope, scopeStatus: "confirmed", participants: ["participant-a", "participant-b"], settings: { master: { muted: false, volume: 1, rate: 1 }, participants: {} } });
+
+  await owner.enqueue(candidate({ id: "announcement-a" }));
+  await owner.enqueue(candidate({ id: "announcement-b", participantId: "participant-b" }));
+  owner.dispose();
+
+  expect(outcomes).toEqual(["announcement-a:started", "announcement-b:stopped", "announcement-a:stopped"]);
 });
 
 test("browser autoplay denial is blocked rather than failed", async () => {

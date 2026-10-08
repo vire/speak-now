@@ -71,6 +71,10 @@ export const createScopedPlaybackOwner = ({ createAudio, report }: { createAudio
 
   const send = (item: PlaybackCandidate, outcome: PlaybackOutcome, replay: boolean, onAccepted?: () => void) => deliver({ item, outcome, replay }, onAccepted);
 
+  const retireQueued = () => {
+    for (const item of queued.splice(0)) send(item, "stopped", false);
+  };
+
   let drainQueue: () => Promise<void>;
   const completeEnded = (current: ActivePlayback) => {
     if (!current.ended || !current.reportedStart || current.completionSent) return;
@@ -155,7 +159,7 @@ export const createScopedPlaybackOwner = ({ createAudio, report }: { createAudio
 
   return {
     sync(input: { scope: ListeningScopeResponse | null; scopeStatus: "idle" | "pending" | "confirmed" | "failed" | "unresolved"; participants: readonly string[]; settings: PlaybackSettings }) {
-      if (input.scopeStatus !== "confirmed" || !sameScope(scope, input.scope)) queued.length = 0;
+      if (input.scopeStatus !== "confirmed" || !sameScope(scope, input.scope)) retireQueued();
       scope = input.scope;
       scopeStatus = input.scopeStatus;
       participants = new Set(input.participants);
@@ -174,8 +178,8 @@ export const createScopedPlaybackOwner = ({ createAudio, report }: { createAudio
     },
     dispose() {
       if (disposed) return;
+      retireQueued();
       disposed = true;
-      queued.length = 0;
       stopActive();
     },
     async retryPendingAcknowledgements() {

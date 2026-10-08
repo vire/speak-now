@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { BrowserApiError, type BrowserApi as BrowserApiContract, type EventNotification, type HistoryPage, type StateResponse } from "./api";
+import { createScopedPlaybackOwner } from "./playback";
 import { createBrowserSession } from "./session";
 
 const sourceA = "source-a";
@@ -208,8 +209,46 @@ test("a durable Heard receipt refreshes idle candidates and the active history f
 
   await session.acknowledgePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 7 });
 
-  expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("heard");
-  expect(session.snapshot().history.announcements).toMatchObject([{ playback: { status: "heard" } }]);
+  await eventually(() => expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("heard"));
+  await eventually(() => expect(session.snapshot().history.announcements).toMatchObject([{ playback: { status: "heard" } }]));
+});
+
+test("an accepted Started receipt lets an ended owner acknowledge Heard while a settings refresh is held", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const heldSettings = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: [] }>();
+  let settingsReads = 0;
+  const outcomes: string[] = [];
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ++settingsReads === 1 ? { master: { muted: false, volume: 1, speed: 1 }, participants: [] } : heldSettings.promise,
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready", id: "a".repeat(64) }, playback: { status: "started" } }] }),
+    updatePlaybackAttempt: async (attemptId, update) => {
+      outcomes.push(update.state);
+      return { attemptId, state: update.state, authorizationGeneration: update.authorizationGeneration };
+    },
+  };
+  const session = sessionFor(api);
+  let end: (() => void) | undefined;
+  const owner = createScopedPlaybackOwner({
+    createAudio: () => {
+      const audio = { onended: null as (() => void) | null, onerror: null as (() => void) | null, pause: () => undefined, play: async () => undefined, volume: 1, playbackRate: 1 };
+      end = () => audio.onended?.();
+      return audio;
+    },
+    report: (event) => session.acknowledgePlaybackAttempt(event.item.attemptId!, { state: event.outcome, authorizationGeneration: event.item.authorizationGeneration! }).then(() => undefined),
+  });
+
+  await session.start(sourceA);
+  owner.sync({ scope: joined, scopeStatus: "confirmed", participants: ["participant-a"], settings: { master: { muted: false, volume: 1, rate: 1 }, participants: {} } });
+  await owner.play({ id: "announcement:job-a", attemptId: "attempt-a", authorizationGeneration: 7, kind: "announcement", audioUrl: "/api/playback/attempts/attempt-a/media", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7 });
+  end?.();
+  await Bun.sleep(1);
+
+  expect(outcomes).toEqual(["started", "heard"]);
+  heldSettings.resolve({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
 });
 
 test("a delayed playback settings read cannot undo an optimistic accepted mute", async () => {

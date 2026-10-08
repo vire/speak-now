@@ -247,12 +247,11 @@ export const createBrowserSession = (api: BrowserApi) => {
     const acknowledgementLifecycle = lifecycle;
     const receipt = await api.updatePlaybackAttempt(attemptId, update);
     if (stopped || acknowledgementLifecycle !== lifecycle || !sameScope(confirmedScope, acknowledgedScope)) return receipt;
-    try {
-      await Promise.all([refreshPlayback(), refreshHistory()]);
-    } catch (error) {
+    void Promise.all([refreshPlayback(), refreshHistory()]).catch((error) => {
+      if (stopped || acknowledgementLifecycle !== lifecycle || !sameScope(confirmedScope, acknowledgedScope)) return;
       transportError = error instanceof Error ? error.message : "playback_refresh_failed";
       publish();
-    }
+    });
     return receipt;
   };
 
