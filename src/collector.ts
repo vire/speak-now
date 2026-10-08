@@ -6,7 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Result from "effect/Result";
 import { captureStructured, captureTerminal, participantIdentity, reconcileTopology, topologyFromHerdr } from "./capture";
-import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson, type Activity, type Cursor, type Participant, type Topology } from "./shared";
+import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson, formatEvidence, type Activity, type Cursor, type Participant, type Topology } from "./shared";
 import { summarize } from "./summarizer";
 import { synthesize } from "./speech";
 import { collectorLogger } from "./logging";
@@ -500,10 +500,6 @@ async function processPending(config: CollectorConfig, state: CollectorState, si
   return clip;
 }
 
-function formatEvidence(activity: Activity): string {
-  const revision = activity.revisionOf ? `; revision-of=${activity.revisionOf}; revision=${activity.revisionId}` : "";
-  return `[Evidence id=${activity.id}; capture-status=${activity.status}; excerpt=${activity.excerpt}; original-text-bytes=${activity.originalTextBytes}${revision}]\n${activity.text}`;
-}
 
 function enqueueActivity(state: CollectorState, activity: Activity, accepted: Activity[]): void {
   if (state.activityIds.has(activity.id)) return;

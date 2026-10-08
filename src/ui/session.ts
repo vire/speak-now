@@ -1,4 +1,4 @@
-import type { BrowserApi, HistoryFilters, HistoryPage, ListeningSelection, StateResponse } from "./api";
+import { BrowserApiError, type BrowserApi, type CatchUpResponse, type HistoryFilters, type HistoryPage, type ListeningScopeResponse, type ListeningSelection, type StateResponse } from "./api";
 
 type CachedState = { state: StateResponse; stale: boolean };
 type ScopeStatus = "idle" | "pending" | "confirmed" | "failed" | "unresolved";
@@ -12,11 +12,14 @@ export type BrowserSessionSnapshot = {
   history: HistoryPage;
   historyStatus: "loading" | "ready" | "error";
   historyFilters: Omit<HistoryFilters, "cursor">;
+  catchUp?: CatchUpResponse;
+  catchUpPending: boolean;
   transportError?: string;
 };
 
 const emptyHistory = (): HistoryPage => ({ announcements: [], results: [] });
 const withoutCursor = ({ cursor: _cursor, ...filters }: HistoryFilters): Omit<HistoryFilters, "cursor"> => filters;
+const sameScope = (left: ListeningScopeResponse | null, right: ListeningScopeResponse | null) => left?.sourceId === right?.sourceId && left?.workspaceId === right?.workspaceId && left?.tabId === right?.tabId && left?.generation === right?.generation;
 
 export const createBrowserSession = (api: BrowserApi) => {
   let stopped = false;
@@ -27,6 +30,12 @@ export const createBrowserSession = (api: BrowserApi) => {
   let historyFilters: Omit<HistoryFilters, "cursor"> = { order: "desc", limit: 50 };
   let history = emptyHistory();
   let historyStatus: "loading" | "ready" | "error" = "loading";
+  let catchUp: CatchUpResponse | undefined;
+  let catchUpPending = false;
+  let catchUpRequest: { scope: ListeningScopeResponse; requestId: string } | undefined;
+  let retryCatchUp = false;
+  let catchUpInvalidated = false;
+  let catchUpRead = 0;
   let transportError: string | undefined;
   let ready = false;
   let stateRead = 0;
@@ -42,13 +51,14 @@ export const createBrowserSession = (api: BrowserApi) => {
   let scopeWrite: Promise<void> | undefined;
   const listeners = new Set<() => void>();
 
-  const view = (): BrowserSessionSnapshot => ({ ready, selectedSourceId, stateBySource, confirmedScope, scopeStatus, history, historyStatus, historyFilters, ...(transportError ? { transportError } : {}) });
+  const view = (): BrowserSessionSnapshot => ({ ready, selectedSourceId, stateBySource, confirmedScope, scopeStatus, history, historyStatus, historyFilters, catchUpPending, ...(catchUp ? { catchUp } : {}), ...(transportError ? { transportError } : {}) });
   let current = view();
   const publish = () => {
     current = view();
     for (const listener of listeners) listener();
   };
   const snapshot = () => current;
+  const clearCatchUp = () => { catchUpRead += 1; catchUp = undefined; catchUpPending = false; catchUpRequest = undefined; retryCatchUp = false; catchUpInvalidated = false; };
 
   const markAllStale = () => {
     stateBySource = Object.fromEntries(Object.entries(stateBySource).map(([sourceId, cached]) => [sourceId, { ...cached, stale: true }]));
@@ -134,7 +144,10 @@ export const createBrowserSession = (api: BrowserApi) => {
         selectedSourceId = sourceId;
         stateBySource = { ...stateBySource, [sourceId]: { state, stale: false } };
       }
-      if (readScopeEpoch === scopeEpoch) confirmedScope = state.scope;
+      if (readScopeEpoch === scopeEpoch) {
+        if (!sameScope(confirmedScope, state.scope)) clearCatchUp();
+        confirmedScope = state.scope;
+      }
       ready = true;
       eventCursor = state.eventSequence;
       transportError = undefined;
@@ -153,6 +166,10 @@ export const createBrowserSession = (api: BrowserApi) => {
   const resnapshot = async () => {
     markAllStale();
     const [stateRead] = await Promise.all([refreshState(), refreshHistory()]);
+    if (stateRead && catchUp?.status === "pending" && catchUpRequest) {
+      if (catchUpPending) catchUpInvalidated = true;
+      else await requestCatchUp();
+    }
     return stateRead;
   };
 
@@ -168,6 +185,7 @@ export const createBrowserSession = (api: BrowserApi) => {
     const writeLifecycle = lifecycle;
     stateRead += 1;
     stateController?.abort();
+    clearCatchUp();
     scopeStatus = "pending";
     publish();
     const write = (async () => {
@@ -197,6 +215,40 @@ export const createBrowserSession = (api: BrowserApi) => {
     } finally {
       if (scopeWrite === write) scopeWrite = undefined;
     }
+  };
+
+  const requestCatchUp = async () => {
+    const scope = confirmedScope;
+    if (!scope || scopeStatus !== "confirmed" || scopeWrite || scopeUnresolved) throw new Error("Catch up requires a confirmed joined scope");
+    const request = retryCatchUp && catchUpRequest && sameScope(catchUpRequest.scope, scope) ? catchUpRequest : { scope, requestId: crypto.randomUUID() };
+    const read = ++catchUpRead;
+    catchUpRequest = request;
+    catchUpPending = true;
+    catchUpInvalidated = false;
+    catchUp = { status: "pending", requestId: request.requestId, generation: scope.generation, scope, entries: [] };
+    publish();
+    try {
+      const response = await api.requestCatchUp({ sourceId: scope.sourceId, generation: scope.generation, requestId: request.requestId });
+      if (stopped || read !== catchUpRead || !sameScope(confirmedScope, scope) || scopeStatus !== "confirmed") return;
+      if (!sameScope(response.scope, scope)) {
+        clearCatchUp();
+        publish();
+        return;
+      }
+      catchUpPending = false;
+      catchUp = response;
+      retryCatchUp = response.status === "pending";
+      if (retryCatchUp && catchUpInvalidated) return await requestCatchUp();
+    } catch (error) {
+      if (stopped || read !== catchUpRead || !sameScope(confirmedScope, scope) || scopeStatus !== "confirmed") return;
+      if (error instanceof BrowserApiError && (error.code === "no_joined_scope" || error.code === "stale_generation")) clearCatchUp();
+      else {
+        catchUpPending = false;
+        retryCatchUp = true;
+        catchUp = { status: "failed", requestId: request.requestId, generation: scope.generation, scope, entries: [{ participantId: "unavailable", location: { sourceId: scope.sourceId }, timestamp: new Date().toISOString(), evidenceRefs: [], status: "failed", reason: "Catch up could not be completed. Retry this request." }] };
+      }
+    }
+    publish();
   };
 
   return {
@@ -233,11 +285,13 @@ export const createBrowserSession = (api: BrowserApi) => {
     loadMoreHistory: async () => {
       if (history.nextCursor) await refreshHistory(history.nextCursor);
     },
+    catchUp: requestCatchUp,
     stop() {
       stopped = true;
       lifecycle += 1;
       scopeEpoch += 1;
       scopeWrite = undefined;
+      clearCatchUp();
       stateRead += 1;
       historyRead += 1;
       stateController?.abort();

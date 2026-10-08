@@ -105,6 +105,7 @@ const batch = (overrides: Record<string, unknown> = {}) => ({
 });
 
 const postBatch = (origin: string, value: Record<string, unknown>) => fetch(`${origin}/api/collector/batches`, { method: "POST", headers: collectorHeaders, body: JSON.stringify(value) });
+const requestCatchUp = (origin: string, value: { sourceId: string; generation: number; requestId: string }) => fetch(`${origin}/api/catch-up`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
 
 const activity = (id: string, cursor: string) => ({
   id,
@@ -906,3 +907,214 @@ test("SSE replay advances across durable event pages without skipping committed 
     await stopServer(runtime);
   }
 }, 15_000);
+
+test("Catch up neither joins implicitly nor accepts a stale active-scope fence", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    const unjoined = await requestCatchUp(runtime.origin, { sourceId, generation: 0, requestId: "unjoined-request" });
+    expect(unjoined.status).toBe(409);
+    expect(await unjoined.json()).toEqual({ code: "no_joined_scope" });
+
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, workspaceId }),
+    });
+    expect(selected.status).toBe(200);
+    const { generation } = await selected.json() as { generation: number };
+    const stale = await requestCatchUp(runtime.origin, { sourceId, generation: generation - 1, requestId: "stale-request" });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toEqual({ code: "stale_generation" });
+    expect((await (await fetch(`${runtime.origin}/api/state`)).json() as { scope: unknown }).scope).toEqual(expect.objectContaining({ sourceId, workspaceId, generation }));
+  } finally {
+    await stopServer(runtime);
+  }
+}, 10_000);
+
+test("server startup keeps an expired Catch up key tombstone without replaying new evidence", async () => {
+  const first = await startServer("collector-test-token");
+  let restarted: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    expect((await postBatch(first.origin, batch({ batchId: "prune-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${first.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceId, workspaceId }) });
+    const { generation } = await selected.json() as { generation: number };
+    expect((await postBatch(first.origin, batch({ batchId: "prune-baseline", listeningGeneration: generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }], activities: [] }))).status).toBe(201);
+    expect((await postBatch(first.origin, batch({ batchId: "prune-evidence", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("prune-old-evidence", "cursor-3")] }))).status).toBe(201);
+    expect((await requestCatchUp(first.origin, { sourceId, generation, requestId: "old-request" })).status).toBe(202);
+    await stopServer(first, false);
+    const database = new Database(join(first.dataDirectory, "speak-now.sqlite"));
+    database.run("UPDATE catch_up_requests SET created_at = ? WHERE request_id = 'old-request'", [new Date(Date.now() - 31 * 24 * 60 * 60 * 1_000).toISOString()]);
+    database.run("UPDATE jobs SET expires_at = ? WHERE catch_up_request_id = 'old-request'", [new Date(Date.now() - 60_000).toISOString()]);
+    database.run("UPDATE events SET expires_at = ? WHERE event_id = 'prune-old-evidence'", [new Date(Date.now() - 60_000).toISOString()]);
+    database.close();
+    restarted = await startServer("collector-test-token", { dataDirectory: first.dataDirectory });
+    const reopened = new Database(join(first.dataDirectory, "speak-now.sqlite"));
+    const count = reopened.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM catch_up_requests WHERE request_id = 'old-request'").get()?.count;
+    const entries = reopened.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM catch_up_entries WHERE request_id = 'old-request'").get()?.count;
+    reopened.close();
+    expect(count).toBe(1);
+    expect(entries).toBe(0);
+    expect((await postBatch(restarted.origin, batch({ batchId: "prune-new-evidence", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-3", next: "cursor-4" }], activities: [activity("prune-new-evidence", "cursor-4")] }))).status).toBe(201);
+    const retry = await requestCatchUp(restarted.origin, { sourceId, generation, requestId: "old-request" });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ status: "unavailable", entries: [] });
+  } finally {
+    if (restarted) await stopServer(restarted, false);
+    else if (first.server.exitCode === null) await stopServer(first, false);
+    await rm(first.dataDirectory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("Catch up returns one durable pending recap for an idempotency key and preserves captured evidence location", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-evidence-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, workspaceId }),
+    });
+    const { generation } = await selected.json() as { generation: number };
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-evidence-baseline", listeningGeneration: generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }], activities: [] }))).status).toBe(201);
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-evidence-activity", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("catch-up-evidence", "cursor-3")] }))).status).toBe(201);
+
+    const body = { sourceId, generation, requestId: "catch-up-evidence-request" };
+    const first = await requestCatchUp(runtime.origin, body);
+    expect(first.status).toBe(202);
+    const recap = await first.json() as { status: string; requestId: string; generation: number; scope: { sourceId: string; workspaceId: string; generation: number }; entries: Array<{ status: string; participantId: string; location: { sourceId: string; workspaceId?: string; tabId?: string; paneId?: string }; timestamp: string; evidenceRefs: string[]; reason: string }> };
+    expect({ status: recap.status, requestId: recap.requestId, generation: recap.generation, scope: recap.scope }).toEqual({ status: "pending", requestId: body.requestId, generation, scope: { sourceId, workspaceId, generation } });
+    expect(recap.entries).toHaveLength(1);
+    expect(recap.entries[0]).toEqual({ status: "pending", participantId, location: { sourceId, workspaceId, tabId, paneId }, timestamp: fixtureObservedAt, evidenceRefs: ["catch-up-evidence"], reason: "processing" });
+    const database = new Database(join(runtime.dataDirectory, "speak-now.sqlite"));
+    const frozenEntry = database.query<Record<string, unknown>, []>("SELECT * FROM catch_up_entries LIMIT 1").get();
+    database.close();
+    expect(JSON.stringify(frozenEntry)).not.toContain("Finished the requested work.");
+    const retried = await requestCatchUp(runtime.origin, body);
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual(recap);
+  } finally {
+    await stopServer(runtime);
+  }
+}, 10_000);
+
+test("Catch up reports unavailable instead of assigning a legacy unknown-location event to the current scope", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-legacy-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, workspaceId }),
+    });
+    const { generation } = await selected.json() as { generation: number };
+    const database = new Database(join(runtime.dataDirectory, "speak-now.sqlite"));
+    database.run("INSERT INTO events (event_id, source_id, digest, participant_id, source_cursor, observed_at, evidence_json, expires_at, capture_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)", "legacy-unknown-location", sourceId, "legacy-digest", participantId, "legacy-cursor", fixtureObservedAt, JSON.stringify(activity("legacy-unknown-location", "legacy-cursor")), new Date(Date.now() + 60_000).toISOString());
+    database.close();
+
+    const response = await requestCatchUp(runtime.origin, { sourceId, generation, requestId: "legacy-location-request" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "unavailable", requestId: "legacy-location-request", generation, scope: { sourceId, workspaceId, generation }, entries: [] });
+  } finally {
+    await stopServer(runtime);
+  }
+}, 10_000);
+
+test("Catch up excludes expired evidence and freezes an unavailable retry despite newer activity", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-retention-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, workspaceId }),
+    });
+    const { generation } = await selected.json() as { generation: number };
+    const database = new Database(join(runtime.dataDirectory, "speak-now.sqlite"));
+    const location = { workspace: { id: workspaceId, label: "Workspace A" }, tab: { id: tabId, label: "Tab A" }, pane: { id: paneId, label: "Pane A" }, participant: { id: participantId, kind: "codex" } };
+    database.run("INSERT INTO events (event_id, source_id, digest, participant_id, source_cursor, observed_at, evidence_json, expires_at, capture_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", "expired-catch-up-evidence", sourceId, "expired-digest", participantId, "expired-cursor", new Date(Date.now() - 25 * 60 * 60 * 1_000).toISOString(), JSON.stringify(activity("expired-catch-up-evidence", "expired-cursor")), new Date(Date.now() - 60_000).toISOString(), JSON.stringify(location));
+    database.close();
+
+    const body = { sourceId, generation, requestId: "frozen-unavailable-request" };
+    const first = await requestCatchUp(runtime.origin, body);
+    expect(first.status).toBe(200);
+    const unavailable = await first.json();
+    expect(unavailable).toMatchObject({ status: "unavailable", requestId: body.requestId, generation, entries: [] });
+
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-retention-baseline", listeningGeneration: generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }], activities: [] }))).status).toBe(201);
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-retention-newer", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("newer-catch-up-evidence", "cursor-3")] }))).status).toBe(201);
+    const retried = await requestCatchUp(runtime.origin, body);
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual(unavailable);
+  } finally {
+    await stopServer(runtime);
+  }
+}, 10_000);
+
+test("Catch up exposes an empty-citation worker result as failed, never as a recap", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-validation-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, workspaceId }),
+    });
+    const { generation } = await selected.json() as { generation: number };
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-validation-baseline", listeningGeneration: generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }], activities: [] }))).status).toBe(201);
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-validation-activity", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("catch-up-validation", "cursor-3")] }))).status).toBe(201);
+    const body = { sourceId, generation, requestId: "catch-up-validation-request" };
+    expect((await requestCatchUp(runtime.origin, body)).status).toBe(202);
+
+    const automatic = await fetch(`${runtime.origin}/api/collector/jobs/claim`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ workerId: "automatic-worker" }) });
+    const automaticJob = await automatic.json() as { jobId: string; leaseToken: string };
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${automaticJob.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: automaticJob.leaseToken, resultKey: "automatic-result", result: { speak: false, kind: "progress", text: "Normal automatic result.", evidenceEventIds: ["catch-up-validation"] } }) })).status).toBe(201);
+    const recap = await fetch(`${runtime.origin}/api/collector/jobs/claim`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ workerId: "recap-worker" }) });
+    const recapJob = await recap.json() as { jobId: string; leaseToken: string };
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${recapJob.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: recapJob.leaseToken, resultKey: "empty-citations", result: { speak: false, kind: "progress", text: "Looks successful.", evidenceEventIds: [] } }) })).status).toBe(201);
+
+    const result = await requestCatchUp(runtime.origin, body);
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ status: "failed", entries: [expect.objectContaining({ status: "failed", reason: "invalid_summary" })] });
+    const history = await (await fetch(`${runtime.origin}/api/history?sourceId=${encodeURIComponent(sourceId)}`)).json() as { results: Array<{ jobId: string }> };
+    expect(history.results.some((row) => row.jobId === recapJob.jobId)).toBe(false);
+  } finally {
+    await stopServer(runtime);
+  }
+}, 10_000);
+
+test("Catch up marks mixed usable and gap evidence partial without reading outside retained capture", async () => {
+  const runtime = await startServer("collector-test-token");
+  let restarted: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-gap-bootstrap", activities: [], baselineReady: [] }))).status).toBe(201);
+    const selected = await fetch(`${runtime.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceId, workspaceId }) });
+    const { generation } = await selected.json() as { generation: number };
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-gap-baseline", listeningGeneration: generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }], activities: [] }))).status).toBe(201);
+    const gap = { ...activity("catch-up-gap", "cursor-3"), kind: "lifecycle", status: "gap", text: "", originalTextBytes: 0 };
+    expect((await postBatch(runtime.origin, batch({ batchId: "catch-up-gap-evidence", listeningGeneration: generation, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("catch-up-good", "cursor-3"), gap] }))).status).toBe(201);
+    const response = await requestCatchUp(runtime.origin, { sourceId, generation, requestId: "catch-up-gap-request" });
+    expect(response.status).toBe(202);
+    expect((await response.json() as { entries: Array<{ status: string; reason: string; evidenceRefs: string[] }> }).entries).toEqual([expect.objectContaining({ status: "pending", reason: "incomplete_evidence", evidenceRefs: ["catch-up-good"] })]);
+    let recap: { jobId: string; leaseToken: string; evidenceEventIds: string[] };
+    for (;;) {
+      const claimed = await (await fetch(`${runtime.origin}/api/collector/jobs/claim`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ workerId: "recap-worker" }) })).json() as { jobId: string; leaseToken: string; evidenceEventIds: string[] };
+      if (claimed.jobId.startsWith("catchup:")) { recap = claimed; break; }
+      expect((await fetch(`${runtime.origin}/api/collector/jobs/${claimed.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: claimed.leaseToken, resultKey: "normal-result", result: { speak: false, kind: "progress", text: "Normal summary.", evidenceEventIds: claimed.evidenceEventIds } }) })).status).toBe(201);
+    }
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${recap.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: recap.leaseToken, resultKey: "recap-result", result: { speak: true, kind: "progress", text: "The agent finished a task.", evidenceEventIds: ["catch-up-good"] } }) })).status).toBe(201);
+    const history = await (await fetch(`${runtime.origin}/api/history?sourceId=${encodeURIComponent(sourceId)}`)).json() as { results: Array<{ jobId: string; catchUp?: { status: string; reason: string } }> };
+    expect(history.results.find((row) => row.jobId === recap.jobId)?.catchUp).toEqual({ status: "partial", reason: "incomplete_evidence" });
+    await stopServer(runtime, false);
+    const database = new Database(join(runtime.dataDirectory, "speak-now.sqlite"));
+    database.run("UPDATE catch_up_requests SET created_at = ? WHERE request_id = 'catch-up-gap-request'", [new Date(Date.now() - 31 * 24 * 60 * 60 * 1_000).toISOString()]);
+    database.close();
+    restarted = await startServer("collector-test-token", { dataDirectory: runtime.dataDirectory });
+    const retained = await (await fetch(`${restarted.origin}/api/history?sourceId=${encodeURIComponent(sourceId)}`)).json() as { results: Array<{ jobId: string; catchUp?: { status: string; reason: string } }> };
+    expect(retained.results.find((row) => row.jobId === recap.jobId)?.catchUp).toEqual({ status: "partial", reason: "incomplete_evidence" });
+  } finally {
+    if (restarted) await stopServer(restarted, false);
+    else if (runtime.server.exitCode === null) await stopServer(runtime, false);
+    await rm(runtime.dataDirectory, { recursive: true, force: true });
+  }
+}, 10_000);

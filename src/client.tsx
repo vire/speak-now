@@ -2,6 +2,7 @@ import React, { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { createPrototypePlaybackOwner, type PrototypePlaybackOwner } from "./prototype-playback";
 import { createBrowserApi } from "./ui/api";
+import { CatchUpView } from "./ui/catch-up";
 import { createBrowserSession } from "./ui/session";
 import { HierarchyView } from "./ui/tree";
 import "./ui/tree.css";
@@ -48,7 +49,8 @@ function App() {
       <h1>Speak Now</h1>
       <p>{message}</p>
       {browserSnapshot.transportError && <p role="alert">Could not refresh source state: {browserSnapshot.transportError} <button type="button" onClick={() => { void browserSession.start(browserSnapshot.selectedSourceId); }}>Retry source state</button></p>}
-      <HierarchyView snapshot={browserSnapshot} onBrowse={(sourceId) => { void browserSession.selectSource(sourceId); }} onRetry={() => { void browserSession.start(browserSnapshot.selectedSourceId); }} onJoinWorkspace={(sourceId, workspaceId) => { void browserSession.joinWorkspace(sourceId, workspaceId); }} onJoinTab={(sourceId, tabId) => { void browserSession.joinTab(sourceId, tabId); }} onLeave={() => { void browserSession.leave(); }} onHistoryFilters={(filters) => { void browserSession.setHistoryFilters(filters); }} onLoadMore={() => { void browserSession.loadMoreHistory(); }} />
+        <HierarchyView snapshot={browserSnapshot} onBrowse={(sourceId) => { void browserSession.selectSource(sourceId); }} onRetry={() => { void browserSession.start(browserSnapshot.selectedSourceId); }} onJoinWorkspace={(sourceId, workspaceId) => { void browserSession.joinWorkspace(sourceId, workspaceId); }} onJoinTab={(sourceId, tabId) => { void browserSession.joinTab(sourceId, tabId); }} onLeave={() => { void browserSession.leave(); }} onHistoryFilters={(filters) => { void browserSession.setHistoryFilters(filters); }} onLoadMore={() => { void browserSession.loadMoreHistory(); }} />
+        <CatchUpView snapshot={browserSnapshot} onCatchUp={() => { void browserSession.catchUp(); }} />
       <section className="prototype-demo" aria-label="Prototype demo"><h2>Prototype demo</h2><p>This separate demo is suspended while listening is joined.</p><button
         type="button"
         onClick={() => {
@@ -60,7 +62,7 @@ function App() {
         {audioError ? "Retry audio" : audioEnabled ? "Audio enabled" : "Enable audio"}
       </button>
       {audioError && <p role="alert">{audioError}</p>}</section>
-      <section className="unavailable-actions" aria-label="Unavailable controls"><h2>Future controls</h2><button type="button" disabled aria-describedby="catch-up-note">Catch up</button><p id="catch-up-note">Catch up is unavailable pending SN-07.</p><button type="button" disabled aria-describedby="audio-controls-note">Mute, volume, speed, and playback history</button><p id="audio-controls-note">These controls are unavailable pending SN-08.</p></section>
+        <section className="unavailable-actions" aria-label="Unavailable controls"><h2>Future controls</h2><button type="button" disabled aria-describedby="audio-controls-note">Mute, volume, speed, and playback history</button><p id="audio-controls-note">These controls are unavailable pending SN-08.</p></section>
     </main>
   );
 }

@@ -111,6 +111,113 @@ test("reopened exact batch retry keeps one durable activity acknowledgement and 
   }
 });
 
+test("obsolete pending Catch up does not block a new generation's participant job", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const claimed = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch({ activities: [activity("event-a", "cursor:activity", new Date(Date.now() - 1_000).toISOString())] }));
+      const first = yield* storage.claimJob("worker-a");
+      if (first.kind !== "claimed") throw new Error("expected first job");
+      yield* storage.completeJob(first.job.id, { leaseToken: first.job.leaseToken, resultKey: "first", result: { speak: false, kind: "progress", text: "stored", evidenceEventIds: ["event-a"] } });
+      expect((yield* storage.requestCatchUp({ sourceId, generation: 1, requestId: "old-recap" })).kind).toBe("accepted");
+      yield* storage.setListeningScope(null);
+      const joined = yield* storage.setListeningScope({ sourceId, workspaceId });
+      if (joined.kind === "unknown") throw new Error("expected rejoin");
+      yield* storage.ingestBatch(batch({ batchId: "new-baseline", listeningGeneration: joined.generation, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor:activity", next: "cursor:new-baseline" }], activities: [] }));
+      yield* storage.ingestBatch(batch({ batchId: "new-activity", listeningGeneration: joined.generation, cursors: [{ participantId, previous: "cursor:new-baseline", next: "cursor:new" }], activities: [activity("event-new", "cursor:new")] }));
+      return yield* storage.claimJob("worker-b");
+    }));
+    expect(claimed).toMatchObject({ kind: "claimed", job: { evidenceEventIds: ["event-new"] } });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Catch up bounds formatted worker input before selecting evidence IDs", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      const longId = "i".repeat(512);
+      const activities = Array.from({ length: 20 }, (_, index) => ({ ...activity(`${index}-${longId}`, "cursor:burst", new Date(Date.now() - 1_000).toISOString()), revisionId: longId, revisionOf: longId, text: "x".repeat(900), originalTextBytes: 900 }));
+      yield* storage.ingestBatch(batch({ batchId: "large-recap-input", cursors: [{ participantId, previous: "cursor:baseline", next: "cursor:burst" }], activities }));
+      expect((yield* storage.requestCatchUp({ sourceId, generation: 1, requestId: "bounded-input" })).kind).toBe("accepted");
+    }));
+    const database = new Database(join(dataDir, "speak-now.sqlite"));
+    const row = database.query<{ evidence_json: string }, []>("SELECT evidence_json FROM jobs WHERE catch_up_request_id = 'bounded-input'").get();
+    const entry = database.query<{ reason: string }, []>("SELECT reason FROM catch_up_entries WHERE request_id = 'bounded-input'").get();
+    database.close();
+    const selected = JSON.parse(row?.evidence_json ?? "[]") as Activity[];
+    expect(selected.length).toBeGreaterThan(0);
+    expect(selected.length).toBeLessThan(20);
+    expect(entry?.reason).toBe("input_limit");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Catch up excludes events observed after its acceptance window", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const outcome = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch({ batchId: "future-event", activities: [activity("event-future", "cursor:activity", new Date(Date.now() + 60 * 60 * 1_000).toISOString())] }));
+      return yield* storage.requestCatchUp({ sourceId, generation: 1, requestId: "before-future" });
+    }));
+    expect(outcome).toMatchObject({ kind: "accepted", recap: { status: "unavailable", entries: [] } });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a participant returning to a tab recaps only its latest contiguous tab segment", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    await useStorage(dataDir, (storage) => establishBaseline(storage));
+    const database = new Database(join(dataDir, "speak-now.sqlite"));
+    const expires = new Date(Date.now() + 60_000).toISOString();
+    for (const [index, tab] of ["tab-a", "tab-b", "tab-a"].entries()) {
+      const evidence = activity(`visit-${index}`, `cursor-${index}`, new Date(Date.now() - (3 - index) * 1_000).toISOString());
+      const capture = { workspace: { id: workspaceId, label: "Fixture" }, tab: { id: tab, label: tab }, pane: { id: `pane-${tab}` }, participant: { id: participantId, kind: "codex" } };
+      database.run("INSERT INTO events (event_id, source_id, digest, participant_id, source_cursor, observed_at, evidence_json, expires_at, capture_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [evidence.id, sourceId, evidence.id, participantId, evidence.sourceCursor, evidence.observedAt, JSON.stringify(evidence), expires, JSON.stringify(capture)]);
+    }
+    database.close();
+    const outcome = await useStorage(dataDir, (storage) => storage.requestCatchUp({ sourceId, generation: 1, requestId: "returning-tab" }));
+    expect(outcome).toMatchObject({ kind: "accepted", recap: { entries: [{ evidenceRefs: ["visit-2"], reason: "omitted_older_tab_segments" }] } });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Catch up completion cannot turn expired evidence into a successful recap", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const recapJob = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch({ activities: [activity("event-a", "cursor:activity", new Date(Date.now() - 1_000).toISOString())] }));
+      const automatic = yield* storage.claimJob("worker-a");
+      if (automatic.kind !== "claimed") throw new Error("expected automatic job");
+      yield* storage.completeJob(automatic.job.id, { leaseToken: automatic.job.leaseToken, resultKey: "automatic", result: { speak: false, kind: "progress", text: "stored", evidenceEventIds: ["event-a"] } });
+      yield* storage.requestCatchUp({ sourceId, generation: 1, requestId: "expiring-recap" });
+      const recap = yield* storage.claimJob("worker-b");
+      if (recap.kind !== "claimed") throw new Error("expected recap job");
+      return recap.job;
+    }));
+    const database = new Database(join(dataDir, "speak-now.sqlite"));
+    database.run("UPDATE jobs SET expires_at = ? WHERE job_id = ?", [new Date(Date.now() - 1_000).toISOString(), recapJob.id]);
+    database.close();
+    const outcome = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      const completion = yield* storage.completeJob(recapJob.id, { leaseToken: recapJob.leaseToken, resultKey: "late", result: { speak: true, kind: "progress", text: "Completed the work.", evidenceEventIds: ["event-a"] } });
+      return { completion, history: yield* storage.getHistory({}) };
+    }));
+    expect(outcome.completion.kind).not.toBe("accepted");
+    expect(outcome.history.results.some((row) => row.jobId === recapJob.id)).toBe(false);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("a stale opaque cursor rejects the complete batch without admitting its activity", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
   try {

@@ -1,11 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
-import { BrowserApiError, type BrowserApi, type EventNotification, type HistoryPage, type StateResponse } from "./api";
+import { BrowserApiError, type BrowserApi as BrowserApiContract, type EventNotification, type HistoryPage, type StateResponse } from "./api";
 import { createBrowserSession } from "./session";
 
 const sourceA = "source-a";
 const sourceB = "source-b";
 const workspaceB = "workspace-b";
 const tabB = "tab-b";
+type BrowserApi = Omit<BrowserApiContract, "requestCatchUp"> & Partial<Pick<BrowserApiContract, "requestCatchUp">>;
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -41,7 +42,7 @@ const idleEvents = async function*(): AsyncIterable<EventNotification> {
 
 const sessions = new Set<ReturnType<typeof createBrowserSession>>();
 const sessionFor = (api: BrowserApi) => {
-  const session = createBrowserSession(api);
+  const session = createBrowserSession(api as BrowserApiContract);
   sessions.add(session);
   return session;
 };
@@ -473,4 +474,112 @@ test("a superseded retry cannot gate a newer confirmed scope", async () => {
   await oldRetry;
   expect(session.snapshot().scopeStatus).toBe("confirmed");
   expect(session.snapshot().confirmedScope).toEqual(scope);
+});
+
+test("Catch up requires an explicit confirmed join, reuses its request key after transport failure, and publishes partial evidence", async () => {
+  const requests: Array<{ sourceId: string; generation: number; requestId: string }> = [];
+  let attempts = 0;
+  const api = {
+    readState: async () => state(sourceA, 1, { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 }),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: null, generation: 8 }),
+    openEvents: async () => idleEvents(),
+    requestCatchUp: async (request: { sourceId: string; generation: number; requestId: string }) => {
+      requests.push(request);
+      if (++attempts === 1) throw new TypeError("network unavailable");
+      return { status: "partial", requestId: request.requestId, generation: request.generation, scope: { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 }, entries: [{ participantId: "participant-a", location: { sourceId: sourceA, workspaceId: "workspace-a" }, timestamp: "2026-10-07T12:00:00.000Z", evidenceRefs: ["evidence-a"], status: "partial", text: "The task is blocked.", reason: "Older evidence expired." }] };
+    },
+  } as BrowserApi & { requestCatchUp: (request: { sourceId: string; generation: number; requestId: string }) => Promise<unknown> };
+  const session = sessionFor(api);
+  const catchUp = session as typeof session & { catchUp: () => Promise<void> };
+
+  await expect(catchUp.catchUp()).rejects.toThrow("confirmed joined scope");
+  expect(requests).toEqual([]);
+  await session.start(sourceA);
+  await catchUp.catchUp();
+  await catchUp.catchUp();
+
+  expect(requests).toHaveLength(2);
+  expect(requests.map(({ sourceId: requestSourceId, generation }) => ({ sourceId: requestSourceId, generation }))).toEqual([{ sourceId: sourceA, generation: 7 }, { sourceId: sourceA, generation: 7 }]);
+  expect(requests[0]?.requestId).toBe(requests[1]?.requestId);
+  expect(session.snapshot()).toMatchObject({ catchUp: { status: "partial", entries: [{ text: "The task is blocked.", reason: "Older evidence expired." }] } });
+  await catchUp.catchUp();
+  expect(requests[2]?.requestId).not.toBe(requests[1]?.requestId);
+});
+
+test("a Catch up response from a source with the same generation is discarded after scope switch", async () => {
+  const response = deferred<unknown>();
+  const api = {
+    readState: async () => state(sourceA, 1, { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 }),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: { sourceId: sourceB, tabId: tabB, generation: 7 }, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    requestCatchUp: async () => response.promise,
+  } as BrowserApi & { requestCatchUp: () => Promise<unknown> };
+  const session = sessionFor(api);
+  const catchUp = session as typeof session & { catchUp: () => Promise<void> };
+
+  await session.start(sourceA);
+  const pending = catchUp.catchUp();
+  await session.joinTab(sourceB, tabB);
+  response.resolve({ status: "complete", requestId: "request-a", generation: 7, scope: { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 }, entries: [{ participantId: "participant-a", location: { sourceId: sourceA, workspaceId: "workspace-a" }, timestamp: "2026-10-07T12:00:00.000Z", evidenceRefs: ["evidence-a"], status: "complete", text: "Completed." }] });
+  await pending;
+
+  expect(session.snapshot()).not.toHaveProperty("catchUp");
+  expect(session.snapshot().confirmedScope).toEqual({ sourceId: sourceB, tabId: tabB, generation: 7 });
+});
+
+test("a completed recap replaces pending text after the persisted completion event", async () => {
+  const completion = deferred<EventNotification>();
+  const scope = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const requests: string[] = [];
+  let streams = 0;
+  const api = {
+    readState: async () => state(sourceA, streams ? 2 : 1, scope),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope, generation: 7 }),
+    openEvents: async () => ++streams === 1 ? (async function*() { yield await completion.promise; })() : idleEvents(),
+    requestCatchUp: async (request: { requestId: string }) => {
+      requests.push(request.requestId);
+      return requests.length === 1
+        ? { status: "pending", requestId: request.requestId, generation: 7, scope, entries: [] }
+        : { status: "complete", requestId: request.requestId, generation: 7, scope, entries: [{ participantId: "participant-a", location: { sourceId: sourceA, workspaceId: "workspace-a" }, timestamp: "2026-10-07T12:00:00.000Z", evidenceRefs: ["evidence-a"], status: "complete", text: "The task finished." }] };
+    },
+  } as BrowserApi;
+  const session = sessionFor(api);
+  await session.start(sourceA);
+  await session.catchUp();
+  expect(session.snapshot().catchUp?.status).toBe("pending");
+  completion.resolve({ id: 2, event: "completed" });
+  await eventually(() => expect(session.snapshot().catchUp?.status).toBe("complete"));
+  expect(requests).toEqual([requests[0], requests[0]]);
+  session.stop();
+});
+
+test("completion arriving during the initial Catch up request still refreshes its frozen key", async () => {
+  const completion = deferred<EventNotification>();
+  const firstResponse = deferred<unknown>();
+  const scope = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const requests: string[] = [];
+  let streams = 0;
+  const api = {
+    readState: async () => state(sourceA, streams ? 2 : 1, scope),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope, generation: 7 }),
+    openEvents: async () => ++streams === 1 ? (async function*() { yield await completion.promise; })() : idleEvents(),
+    requestCatchUp: async (request: { requestId: string }) => {
+      requests.push(request.requestId);
+      return requests.length === 1 ? firstResponse.promise : { status: "complete", requestId: request.requestId, generation: 7, scope, entries: [] };
+    },
+  } as BrowserApi;
+  const session = sessionFor(api);
+  await session.start(sourceA);
+  const started = session.catchUp();
+  completion.resolve({ id: 2, event: "completed" });
+  await eventually(() => expect(streams).toBe(2));
+  firstResponse.resolve({ status: "pending", requestId: requests[0], generation: 7, scope, entries: [] });
+  await started;
+  await eventually(() => expect(session.snapshot().catchUp?.status).toBe("complete"));
+  expect(requests).toEqual([requests[0], requests[0]]);
+  session.stop();
 });

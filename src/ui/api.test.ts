@@ -48,6 +48,23 @@ test("browser API encodes opaque IDs and sends each endpoint its own public DTO"
   ]);
 });
 
+test("browser API sends only the joined-source Catch up fence and decodes an evidence-backed recap", async () => {
+  const request = { sourceId, generation: 3, requestId: "request-a" };
+  const api = createBrowserApi(async (input, init) => {
+    expect(String(input)).toBe("/api/catch-up");
+    expect(init).toMatchObject({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) });
+    return Response.json({ status: "partial", ...request, scope: { sourceId, tabId, generation: 3 }, entries: [{ participantId, location: { sourceId, tabId }, timestamp: "2026-10-07T12:00:00.000Z", evidenceRefs: ["evidence-a"], status: "partial", text: "A recap.", reason: "Some evidence expired." }] });
+  });
+
+  await expect((api as typeof api & { requestCatchUp: (value: typeof request) => Promise<unknown> }).requestCatchUp(request)).resolves.toMatchObject({ status: "partial", entries: [{ text: "A recap.", reason: "Some evidence expired." }] });
+});
+
+test("browser API rejects recap text on unavailable evidence", async () => {
+  const api = createBrowserApi(async () => Response.json({ status: "unavailable", sourceId, generation: 3, requestId: "request-a", scope: { sourceId, tabId, generation: 3 }, entries: [{ participantId, location: { sourceId, tabId }, timestamp: "2026-10-07T12:00:00.000Z", evidenceRefs: [], status: "unavailable", text: "Invented recap.", reason: "Evidence expired." }] }));
+
+  await expect(api.requestCatchUp({ sourceId, generation: 3, requestId: "request-a" })).rejects.toMatchObject({ code: "malformed_response" });
+});
+
 test("browser API decodes a header-cursor SSE stream and rejects expiry or malformed frames", async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const stream = new ReadableStream<Uint8Array>({
