@@ -4,9 +4,11 @@ import { createErrorReporter } from "./errors";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { Cause, Deferred, Effect, Exit, FiberSet } from "effect";
-import { leaseDurationMs, maxAttempts, openStorage, type CatchUpRequest, type HistoryQuery, type IngestBatch, type JobCompletion, type ListeningSelection, type StateQuery, type Storage } from "./storage";
+import { leaseDurationMs, maxAttempts, openStorage, type CatchUpRequest, type HistoryQuery, type IngestBatch, type JobCompletion, type ListeningSelection, type PlaybackSettingsPatch, type StateQuery, type Storage } from "./storage";
+import type { ParticipantId, SourceId } from "./shared";
 import { validateSummary } from "./summarizer";
 import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson } from "./shared";
+import { synthesize } from "./speech";
 
 const port = Number(Bun.env.PORT ?? 3000);
 const dataDir = Bun.env.SPEAK_NOW_DATA_DIR ?? "data";
@@ -198,7 +200,7 @@ const historyTimestamp = (value: string | undefined) => {
 };
 
 const validHistoryQuery = (url: URL) => {
-  const names = ["sourceId", "workspaceId", "tabId", "participantId", "from", "to", "limit", "cursor", "order"];
+  const names = ["sourceId", "workspaceId", "tabId", "participantId", "from", "to", "limit", "cursor", "order", "playbackStatus"];
   if (names.some((name) => url.searchParams.getAll(name).length > 1)) return undefined;
   const one = (name: string) => {
     const values = url.searchParams.getAll(name);
@@ -213,13 +215,60 @@ const validHistoryQuery = (url: URL) => {
   const limit = one("limit");
   const cursor = one("cursor");
   const order = one("order");
+  const playbackStatus = one("playbackStatus");
   const canonicalFrom = from === undefined ? undefined : historyTimestamp(from);
   const canonicalTo = to === undefined ? undefined : historyTimestamp(to);
   if ([sourceId, workspaceId, tabId, participantId].some((value) => value !== undefined && !text(value))) return undefined;
   if ((workspaceId !== undefined || tabId !== undefined) && !sourceId || workspaceId !== undefined && tabId !== undefined) return undefined;
   if (from !== undefined && !canonicalFrom || to !== undefined && !canonicalTo || canonicalFrom !== undefined && canonicalTo !== undefined && canonicalFrom > canonicalTo) return undefined;
+  if (limit !== undefined && !/^(?:[1-9][0-9]?|100)$/.test(limit) || cursor !== undefined && !(/^(0|[1-9][0-9]*)$/.test(cursor) && Number.isSafeInteger(Number(cursor))) || order !== undefined && order !== "asc" && order !== "desc" || playbackStatus !== undefined && !["unattempted", "prepared", "started", "heard", "stopped", "skipped", "blocked", "failed"].includes(playbackStatus)) return undefined;
+  return { ...(sourceId ? { sourceId: sourceId as HistoryQuery["sourceId"] } : {}), ...(workspaceId ? { workspaceId: workspaceId as HistoryQuery["workspaceId"] } : {}), ...(tabId ? { tabId: tabId as HistoryQuery["tabId"] } : {}), ...(participantId ? { participantId: participantId as HistoryQuery["participantId"] } : {}), ...(canonicalFrom ? { from: canonicalFrom } : {}), ...(canonicalTo ? { to: canonicalTo } : {}), ...(limit ? { limit: Number(limit) } : {}), ...(cursor ? { cursor } : {}), ...(order ? { order } : {}), ...(playbackStatus ? { playbackStatus: playbackStatus as HistoryQuery["playbackStatus"] } : {}) } satisfies HistoryQuery;
+};
+
+const playbackSettingsQuery = (url: URL) => {
+  const values = url.searchParams.getAll("sourceId");
+  return values.length === 1 && text(values[0]) ? values[0] as SourceId : undefined;
+};
+
+const playbackSettingsPatch = (value: unknown): PlaybackSettingsPatch | undefined => {
+  const body = record(value);
+  if (!body || !exactKeys(body, [], ["master", "participant"]) || !Object.keys(body).length) return undefined;
+  const master = body.master === undefined ? undefined : record(body.master);
+  const participant = body.participant === undefined ? undefined : record(body.participant);
+  if (master && (!exactKeys(master, [], ["muted", "volume", "speed"]) || !Object.keys(master).length || master.muted !== undefined && typeof master.muted !== "boolean" || master.volume !== undefined && (typeof master.volume !== "number" || !Number.isFinite(master.volume) || master.volume < 0 || master.volume > 1) || master.speed !== undefined && (typeof master.speed !== "number" || !Number.isFinite(master.speed) || master.speed < 0.5 || master.speed > 2))) return undefined;
+  if (participant && (!exactKeys(participant, ["sourceId", "participantId"], ["muted", "volume"]) || !text(participant.sourceId) || !text(participant.participantId) || participant.muted === undefined && participant.volume === undefined || participant.muted !== undefined && typeof participant.muted !== "boolean" || participant.volume !== undefined && (typeof participant.volume !== "number" || !Number.isFinite(participant.volume) || participant.volume < 0 || participant.volume > 1))) return undefined;
+  return { ...(master ? { master: master as PlaybackSettingsPatch["master"] } : {}), ...(participant ? { participant: { sourceId: participant.sourceId as SourceId, participantId: participant.participantId as ParticipantId, ...(participant.muted === undefined ? {} : { muted: participant.muted as boolean }), ...(participant.volume === undefined ? {} : { volume: participant.volume as number }) } } : {}) };
+};
+
+const playbackCandidatesQuery = (url: URL) => {
+  const names = ["limit", "cursor", "order"];
+  if (names.some((name) => url.searchParams.getAll(name).length > 1)) return undefined;
+  const limit = url.searchParams.get("limit") ?? undefined;
+  const cursor = url.searchParams.get("cursor") ?? undefined;
+  const order = url.searchParams.get("order") ?? undefined;
   if (limit !== undefined && !/^(?:[1-9][0-9]?|100)$/.test(limit) || cursor !== undefined && !(/^(0|[1-9][0-9]*)$/.test(cursor) && Number.isSafeInteger(Number(cursor))) || order !== undefined && order !== "asc" && order !== "desc") return undefined;
-  return { ...(sourceId ? { sourceId: sourceId as HistoryQuery["sourceId"] } : {}), ...(workspaceId ? { workspaceId: workspaceId as HistoryQuery["workspaceId"] } : {}), ...(tabId ? { tabId: tabId as HistoryQuery["tabId"] } : {}), ...(participantId ? { participantId: participantId as HistoryQuery["participantId"] } : {}), ...(canonicalFrom ? { from: canonicalFrom } : {}), ...(canonicalTo ? { to: canonicalTo } : {}), ...(limit ? { limit: Number(limit) } : {}), ...(cursor ? { cursor } : {}), ...(order ? { order } : {}) } satisfies HistoryQuery;
+  return { ...(limit ? { limit: Number(limit) } : {}), ...(cursor ? { cursor } : {}), ...(order ? { order: order as "asc" | "desc" } : {}) };
+};
+
+const playbackPrepare = (value: unknown) => {
+  const body = record(value);
+  return body && exactKeys(body, ["sourceId", "participantId", "scopeGeneration"]) && text(body.sourceId) && text(body.participantId) && nonnegativeInteger(body.scopeGeneration)
+    ? { sourceId: body.sourceId as SourceId, participantId: body.participantId as ParticipantId, scopeGeneration: body.scopeGeneration }
+    : undefined;
+};
+
+const playbackAttempt = (value: unknown) => {
+  const body = record(value);
+  return body && exactKeys(body, ["itemId", "sourceId", "participantId", "scopeGeneration", "intent"]) && text(body.itemId, 1_024) && text(body.sourceId) && text(body.participantId) && nonnegativeInteger(body.scopeGeneration) && (body.intent === "automatic" || body.intent === "replay")
+    ? { itemId: body.itemId as string, sourceId: body.sourceId as SourceId, participantId: body.participantId as ParticipantId, scopeGeneration: body.scopeGeneration, intent: body.intent as "automatic" | "replay" }
+    : undefined;
+};
+
+const playbackAttemptStatus = (value: unknown) => {
+  const body = record(value);
+  return body && exactKeys(body, ["state", "authorizationGeneration"]) && typeof body.state === "string" && ["started", "heard", "stopped", "skipped", "blocked", "failed"].includes(body.state) && nonnegativeInteger(body.authorizationGeneration)
+    ? { state: body.state as "started" | "heard" | "stopped" | "skipped" | "blocked" | "failed", authorizationGeneration: body.authorizationGeneration }
+    : undefined;
 };
 
 const stateQuery = (url: URL): StateQuery | undefined => {
@@ -361,6 +410,100 @@ const handleEvents = (storage: Storage, request: import("node:http").IncomingMes
   }
 });
 
+const handlePlaybackCandidates = (storage: Storage, url: URL, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  const query = playbackCandidatesQuery(url);
+  if (!query) return yield* collectorRespond(response, 400, "invalid_request");
+  const page = yield* storageOrError(response, storage.getPlaybackCandidates(query), { operation: "server.playback.candidates" });
+  if (!page) return;
+  const candidates = page.candidates.map((candidate) => ({ itemId: candidate.itemId, kind: candidate.kind, jobId: candidate.jobId, ...(candidate.announcementId ? { announcementId: candidate.announcementId } : {}), sourceId: candidate.sourceId, ...(candidate.workspaceId ? { workspaceId: candidate.workspaceId } : {}), ...(candidate.tabId ? { tabId: candidate.tabId } : {}), participantId: candidate.participantId, originGeneration: candidate.originGeneration, media: candidate.media, playback: candidate.playback, createdAt: candidate.createdAt }));
+  yield* respond(response, 200, { scope: page.scope, candidates, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) });
+});
+
+const handlePlaybackSettings = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, url: URL): Effect.Effect<void> => Effect.gen(function*() {
+  if (request.method === "GET") {
+    const sourceId = playbackSettingsQuery(url);
+    if (!sourceId) return yield* collectorRespond(response, 400, "invalid_request");
+    const settings = yield* storageOrError(response, storage.getPlaybackSettings(sourceId), { operation: "server.playback.settings", sourceId });
+    if (!settings) return yield* collectorRespond(response, 404, "not_found");
+    return yield* respond(response, 200, settings);
+  }
+  if (request.method !== "PUT" || !sameOrigin(request)) return yield* collectorRespond(response, request.method === "PUT" ? 403 : 405, request.method === "PUT" ? "origin_forbidden" : "method_not_allowed");
+  const body = yield* readCollectorJson(request);
+  const patch = body.kind === "json" ? playbackSettingsPatch(body.value) : undefined;
+  if (!patch || body.kind === "too_large") return yield* collectorRespond(response, body.kind === "too_large" ? 413 : 400, body.kind === "too_large" ? "request_too_large" : "invalid_request");
+  const settings = yield* storageOrError(response, storage.updatePlaybackSettings(patch), { operation: "server.playback.settings.update", sourceId: patch.participant?.sourceId });
+  if (!settings) return yield* collectorRespond(response, 404, "not_found");
+  yield* respond(response, 200, settings);
+});
+
+const handlePlaybackPrepare = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, itemId: string): Effect.Effect<void> => Effect.gen(function*() {
+  if (!sameOrigin(request)) return yield* collectorRespond(response, 403, "origin_forbidden");
+  const body = yield* readCollectorJson(request);
+  const prepared = body.kind === "json" ? playbackPrepare(body.value) : undefined;
+  if (!prepared || body.kind === "too_large") return yield* collectorRespond(response, body.kind === "too_large" ? 413 : 400, body.kind === "too_large" ? "request_too_large" : "invalid_request");
+  const outcome = yield* storageOrError(response, storage.preparePlaybackMedia({ ...prepared, itemId }), { operation: "server.playback.prepare", sourceId: prepared.sourceId, participantId: prepared.participantId });
+  if (!outcome) return;
+  if (outcome.kind === "unknown") return yield* respond(response, 404, { code: "not_found", itemId });
+  if (outcome.kind === "stale") return yield* collectorRespond(response, 409, "stale_generation");
+  if (outcome.kind === "pending") return yield* respond(response, 202, { media: { state: "preparing" } });
+  if (outcome.kind === "ready") return yield* respond(response, 200, { media: outcome.candidate.media });
+  if (outcome.kind !== "prepare") return yield* collectorRespond(response, 404, "not_found");
+  return yield* Effect.tryPromise({
+    try: (signal) => synthesize(outcome.text, outcome.jobId, { apiKey: Bun.env.ELEVENLABS_API_KEY, voiceId: Bun.env.ELEVENLABS_VOICE_ID, dataDir, logger, tracer, reporter: errors, jobId: outcome.jobId }, fetch, signal),
+    catch: (cause) => cause,
+  }).pipe(Effect.onInterrupt(() => Effect.uninterruptible(storage.abandonPlaybackMedia(itemId, outcome.token).pipe(Effect.ignore))), Effect.matchCauseEffect({
+    onSuccess: (clip) => Effect.gen(function*() {
+      const mediaId = clip.path.split("/").at(-1)?.replace(/\.mp3$/, "");
+      if (!mediaId || !/^[a-f0-9]{64}$/.test(mediaId)) return yield* collectorRespond(response, 500, "media_failed");
+      const completed = yield* storageOrError(response, storage.completePlaybackMedia(itemId, outcome.token, mediaId), { operation: "server.playback.prepare.complete", sourceId: prepared.sourceId, participantId: prepared.participantId, jobId: outcome.jobId });
+      if (!completed) return;
+      return completed.kind === "ready" ? yield* respond(response, 200, { media: completed.candidate.media }) : yield* collectorRespond(response, 409, "stale_generation");
+    }),
+    onFailure: (cause) => Cause.hasInterruptsOnly(cause) ? storageOrError(response, storage.abandonPlaybackMedia(itemId, outcome.token), { operation: "server.playback.prepare.cancelled", sourceId: prepared.sourceId, participantId: prepared.participantId, jobId: outcome.jobId }).pipe(Effect.asVoid) : Effect.gen(function*() {
+      const completed = yield* storageOrError(response, storage.completePlaybackMedia(itemId, outcome.token, undefined, "provider_failed"), { operation: "server.playback.prepare.failed", sourceId: prepared.sourceId, participantId: prepared.participantId, jobId: outcome.jobId });
+      if (completed?.kind === "failed") yield* collectorRespond(response, 503, "media_unavailable");
+    }),
+  }));
+});
+
+const handlePlaybackAttempt = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, attemptId: string): Effect.Effect<void> => Effect.gen(function*() {
+  if (!sameOrigin(request)) return yield* collectorRespond(response, 403, "origin_forbidden");
+  const body = yield* readCollectorJson(request);
+  const attempt = body.kind === "json" ? playbackAttempt(body.value) : undefined;
+  if (!attempt || body.kind === "too_large") return yield* collectorRespond(response, body.kind === "too_large" ? 413 : 400, body.kind === "too_large" ? "request_too_large" : "invalid_request");
+  const outcome = yield* storageOrError(response, storage.createPlaybackAttempt({ ...attempt, attemptId }), { operation: "server.playback.attempt", sourceId: attempt.sourceId, participantId: attempt.participantId });
+  if (!outcome) return;
+  if (outcome.kind === "unknown") return yield* collectorRespond(response, 404, "not_found");
+  if (outcome.kind === "conflict") return yield* collectorRespond(response, 409, "attempt_conflict");
+  if (outcome.kind === "stale") return yield* collectorRespond(response, 409, "stale_generation");
+  if (outcome.kind !== "created" && outcome.kind !== "duplicate") return;
+  yield* respond(response, outcome.kind === "created" ? 201 : 200, { attemptId: outcome.attempt.attemptId, originGeneration: outcome.attempt.originGeneration, authorizationGeneration: outcome.attempt.authorizationGeneration, state: outcome.attempt.state, mediaUrl: `/api/playback/attempts/${encodeURIComponent(outcome.attempt.attemptId)}/media` });
+});
+
+const handlePlaybackAttemptStatus = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse, attemptId: string): Effect.Effect<void> => Effect.gen(function*() {
+  if (!sameOrigin(request)) return yield* collectorRespond(response, 403, "origin_forbidden");
+  const body = yield* readCollectorJson(request);
+  const update = body.kind === "json" ? playbackAttemptStatus(body.value) : undefined;
+  if (!update || body.kind === "too_large") return yield* collectorRespond(response, body.kind === "too_large" ? 413 : 400, body.kind === "too_large" ? "request_too_large" : "invalid_request");
+  const outcome = yield* storageOrError(response, storage.updatePlaybackAttempt(attemptId, update.state, update.authorizationGeneration), { operation: "server.playback.attempt.status" });
+  if (!outcome) return;
+  if (outcome.kind === "unknown") return yield* collectorRespond(response, 404, "not_found");
+  if (outcome.kind === "stale") return yield* collectorRespond(response, 409, "stale_generation");
+  if (outcome.kind === "invalid_transition") return yield* collectorRespond(response, 409, "invalid_transition");
+  yield* respond(response, 200, { attemptId, authorizationGeneration: update.authorizationGeneration, state: update.state });
+});
+
+const handlePlaybackAttemptMedia = (storage: Storage, response: import("node:http").ServerResponse, attemptId: string): Effect.Effect<void> => Effect.gen(function*() {
+  const media = yield* storageOrError(response, storage.getPlaybackAttemptMedia(attemptId), { operation: "server.playback.media" });
+  if (!media) return yield* collectorRespond(response, 404, "not_found");
+  const file = Bun.file(`${dataDir}/audio/${media.mediaId}.mp3`);
+  const exists = yield* Effect.tryPromise({ try: () => file.exists(), catch: (cause) => cause }).pipe(Effect.match({ onFailure: () => false, onSuccess: (value) => value }));
+  if (!exists) return yield* collectorRespond(response, 404, "not_found");
+  const bytes = yield* Effect.tryPromise({ try: () => file.arrayBuffer(), catch: (cause) => cause }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
+  if (!bytes) return yield* collectorRespond(response, 404, "not_found");
+  yield* Effect.sync(() => { response.writeHead(200, { "Content-Type": "audio/mpeg", "Cache-Control": "no-store" }); response.end(bytes); });
+});
+
 const handleHistory = (storage: Storage, url: URL, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
   const query = validHistoryQuery(url);
   if (!query) return yield* collectorRespond(response, 400, "invalid_request");
@@ -404,6 +547,18 @@ const apiRequest = (storage: Storage, request: import("node:http").IncomingMessa
   if (path === "/api/catch-up" && request.method === "POST") return handleCatchUp(storage, request, response);
   if (path === "/api/state" && request.method === "GET") return handleState(storage, url, response);
   if (path === "/api/events" && request.method === "GET") return handleEvents(storage, request, response);
+  if (path === "/api/playback/candidates" && request.method === "GET") return handlePlaybackCandidates(storage, url, response);
+  if (path === "/api/playback/settings" && (request.method === "GET" || request.method === "PUT")) return handlePlaybackSettings(storage, request, response, url);
+  const prepareMatch = path.match(/^\/api\/playback\/items\/([^/]{1,1024})\/prepare$/);
+  if (prepareMatch && request.method === "POST") {
+    try { return handlePlaybackPrepare(storage, request, response, decodeURIComponent(prepareMatch[1]!)); } catch { return collectorRespond(response, 400, "invalid_request"); }
+  }
+  const attemptStatusMatch = path.match(/^\/api\/playback\/attempts\/([^/]{1,128})\/status$/);
+  if (attemptStatusMatch && request.method === "PUT") return handlePlaybackAttemptStatus(storage, request, response, attemptStatusMatch[1]!);
+  const attemptMediaMatch = path.match(/^\/api\/playback\/attempts\/([^/]{1,128})\/media$/);
+  if (attemptMediaMatch && request.method === "GET") return handlePlaybackAttemptMedia(storage, response, attemptMediaMatch[1]!);
+  const attemptMatch = path.match(/^\/api\/playback\/attempts\/([^/]{1,128})$/);
+  if (attemptMatch && request.method === "PUT") return handlePlaybackAttempt(storage, request, response, attemptMatch[1]!);
   if (path === "/api/history" && request.method === "GET") return handleHistory(storage, url, response);
   if (path === "/api/client-errors" && request.method === "POST") return handleClientErrors(request, response);
   return undefined;
