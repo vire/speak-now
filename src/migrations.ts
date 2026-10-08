@@ -173,4 +173,60 @@ export const migrations: readonly Migration[] = [
       )`,
     ],
   },
+  {
+    id: 8,
+    statements: [
+      `CREATE TABLE IF NOT EXISTS media_items (
+        item_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
+        state TEXT NOT NULL,
+        media_id TEXT,
+        preparation_token TEXT,
+        preparation_started_at TEXT,
+        failure_code TEXT,
+        updated_at TEXT NOT NULL
+      )`,
+      "CREATE INDEX IF NOT EXISTS media_items_state ON media_items(state, preparation_started_at)",
+      "CREATE INDEX IF NOT EXISTS media_items_media ON media_items(media_id)",
+    ],
+  },
+  {
+    id: 9,
+    statements: [
+      `CREATE TABLE IF NOT EXISTS playback_settings (
+        settings_key TEXT PRIMARY KEY CHECK (settings_key = 'global'),
+        muted INTEGER NOT NULL DEFAULT 0,
+        volume REAL NOT NULL DEFAULT 1,
+        speed REAL NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS playback_participant_settings (
+        source_id TEXT NOT NULL REFERENCES sources(source_id),
+        participant_id TEXT NOT NULL,
+        muted INTEGER,
+        volume REAL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, participant_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS playback_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL REFERENCES media_items(item_id),
+        source_id TEXT NOT NULL,
+        participant_id TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        origin_generation INTEGER NOT NULL,
+        authorization_generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      "CREATE INDEX IF NOT EXISTS playback_attempts_item ON playback_attempts(item_id, updated_at DESC)",
+    ],
+  },
+  {
+    id: 10,
+    statements: [
+      "ALTER TABLE media_items ADD COLUMN preparation_generation INTEGER",
+    ],
+  },
 ];

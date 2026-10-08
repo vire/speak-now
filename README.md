@@ -47,9 +47,11 @@ Set the same nonempty `SPEAK_NOW_COLLECTOR_TOKEN` for the app server. It is requ
 
 Collector envelopes use finite shared limits: 20,000 UTF-8 bytes for activity text and opaque cursor tokens, 65,536 encoded bytes for a complete topology, and 524,288 encoded bytes for a request or collector response. A collector retries the exact persisted body and batch identity. A saved body beyond the request limit remains recovery-blocked: it is not sent, reset, split, or assigned a replacement identity.
 
-Live speech needs both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`. Audio is written atomically to `data/audio/`. Without both values, the code reports the explicit prerequisite instead of pretending playback occurred.
+Live speech needs both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in the app server's `.env`. Keep the collector's own state directory separate. The server prepares per-job audio from a completed summary on demand and writes it atomically under its data directory's `audio/` folder. Without both values, media stays unavailable and the browser cannot mark it Heard.
 
-The original prototype audio remains available outside joined listening. Select **Enable audio** to grant browser playback permission for that local demo. Pending or uncertain listening changes and joining a workspace or tab suspend prototype playback so a global latest clip cannot sound like scoped audio. Scoped narration, mute, volume, speed, and playback-history controls are SN-08 work. Text **Catch up** is SN-07 work. Controls shown as unavailable in this hierarchy/read milestone do not provide those functions yet.
+Join a workspace or tab to hear eligible announcements from its current participants. Browsing another source does not change the joined audio scope. New media may briefly show as pending while the server prepares it. A completed or partial **Catch up** recap with valid speech input uses the same scoped playback path. The browser records Heard only after playback ends; a fetched file or accepted play request is not Heard.
+
+The joined playback panel offers durable master mute, volume, and speed, plus per-participant mute and volume. Muting or leaving stops the current clip. Replay starts a new attempt only for an eligible retained item in the current joined scope. History can filter by playback status and shows outcomes separately from summary completion. Browser autoplay policy can still require a user gesture before sound. The original global prototype remains available only outside joined listening; select **Enable audio** to grant playback permission for that separate local demo.
 
 ## API
 
@@ -66,6 +68,13 @@ The original prototype audio remains available outside joined listening. Select 
 | `POST /api/collector/jobs/claim` | Authenticated bounded worker job claim, or 204 when no work is available |
 | `POST /api/collector/jobs/:jobId/result` | Authenticated fenced durable job completion |
 | `PUT /api/listening` | Same-origin selection of a known source workspace or tab |
+| `GET /api/playback/settings?sourceId=...` | Durable master controls and exact participant overrides for a source |
+| `PUT /api/playback/settings` | Validated same-origin master or participant settings change |
+| `GET /api/playback/candidates` | Paginated media and latest playback status for the current joined scope |
+| `POST /api/playback/items/:itemId/prepare` | Prepare one eligible completed announcement or recap for speech |
+| `PUT /api/playback/attempts/:attemptId` | Idempotently authorize a scoped automatic or replay attempt |
+| `PUT /api/playback/attempts/:attemptId/status` | Record started or a terminal playback outcome |
+| `GET /api/playback/attempts/:attemptId/media` | Audio bytes for an authorized current attempt |
 | `GET /api/state?sourceId=...` | Read one source topology, all source metadata, confirmed listening scope, capture facts, freshness, job indicators, and global event sequence; omitting `sourceId` uses the default source |
 | `GET /api/history` | Captured-context filters and bounded stable pagination for persisted summary results and announcements |
 | `GET /api/events` | Same-origin durable SSE replay and live state/history events |
@@ -74,11 +83,12 @@ Set `PORT` to change the listen port (default: `3000`).
 
 `GET /api/state?sourceId=<opaque-id>` is read-only and does not change the listening scope. A duplicate, empty, or malformed `sourceId` returns 400; an unknown source returns 404. `PUT /api/listening` accepts exactly `{ "sourceId": "...", "workspaceId": "..." }`, `{ "sourceId": "...", "tabId": "..." }`, or JSON `null` to leave. Only one scope is active. Its success response is `{ "scope": ..., "generation": ... }`.
 
-History can be queried with `sourceId`, one of `workspaceId` or `tabId`, `participantId`, `from`, `to`, `cursor`, `limit`, and `order=asc|desc`. A workspace or tab filter requires `sourceId`. The default order is ascending; `order=desc` starts with the newest retained results. `from` and `to` are offset-aware ISO timestamps for the job creation time. The server applies stored source, participant, and captured location filters before ordering and pagination, so historical rows remain searchable after a participant moves or exits. For example:
+History can be queried with `sourceId`, one of `workspaceId` or `tabId`, `participantId`, `from`, `to`, `playbackStatus`, `cursor`, `limit`, and `order=asc|desc`. A workspace or tab filter requires `sourceId`. The default order is ascending; `order=desc` starts with the newest retained results. `from` and `to` are offset-aware ISO timestamps for the job creation time. The server applies stored source, participant, captured location, and playback status filters before ordering and pagination, so historical rows remain searchable after a participant moves or exits. For example:
 
 ```sh
 curl 'http://localhost:3000/api/history?sourceId=source-1&tabId=tab-1&order=desc&limit=20'
 curl 'http://localhost:3000/api/history?sourceId=source-1&participantId=participant-1&from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00%3A00%3A00Z&order=asc'
+curl 'http://localhost:3000/api/history?playbackStatus=heard&order=desc&limit=20'
 ```
 
 Source freshness, last retained capture facts, agent lifecycle, summary completion, and speech/playback are separate facts. An agent's presence does not establish its Working status, and a completed summary does not establish playback. Missing lifecycle and verified repository metadata remain Unknown. Capture facts expire by time even without a new event.

@@ -214,6 +214,44 @@ test("GET /assets/client.css serves only the emitted CSS asset with its CSS MIME
   }
 }, 15_000);
 
+test("native server preserves app assets and validated prototype media routes", async () => {
+  const clipId = "a".repeat(64);
+  const announcement = { announcementId: "announcement-fixture", key: clipId, text: "Prototype fixture" };
+  await withServer(async (origin) => {
+    const [page, script, latest, audio, missingAudio, malformedAudio] = await Promise.all([
+      fetch(`${origin}/`),
+      fetch(`${origin}/assets/client.js`),
+      fetch(`${origin}/api/prototype/latest`),
+      fetch(`${origin}/api/prototype/audio/${clipId}`),
+      fetch(`${origin}/api/prototype/audio/${"b".repeat(64)}`),
+      fetch(`${origin}/api/prototype/audio/not-a-media-id`),
+    ]);
+    expect(latest.status).toBe(200);
+    expect({
+      page: { status: page.status, contentType: page.headers.get("content-type") },
+      script: { status: script.status, contentType: script.headers.get("content-type") },
+      latest: { status: latest.status, body: await latest.json() },
+      audio: { status: audio.status, contentType: audio.headers.get("content-type"), body: [...new Uint8Array(await audio.arrayBuffer())] },
+      missingAudio: missingAudio.status,
+      malformedAudio: malformedAudio.status,
+    }).toEqual({
+      page: { status: 200, contentType: "text/html; charset=utf-8" },
+      script: { status: 200, contentType: "text/javascript; charset=utf-8" },
+      latest: { status: 200, body: announcement },
+      audio: { status: 200, contentType: "audio/mpeg", body: [73, 68, 51] },
+      missingAudio: 404,
+      malformedAudio: 404,
+    });
+  }, observedAt, "normal", async (dataDir, activityObservedAt, scenario) => {
+    await seed(dataDir, activityObservedAt, scenario);
+    await mkdir(join(dataDir, "audio"), { recursive: true });
+    await Promise.all([
+      writeFile(join(dataDir, "latest-announcement.json"), JSON.stringify(announcement)),
+      writeFile(join(dataDir, "audio", `${clipId}.mp3`), new Uint8Array([73, 68, 51])),
+    ]);
+  });
+}, 15_000);
+
 test("GET /api/state orders retained Date.parse-admitted +15:00 capture facts by instant after restart", async () => {
   await withServer(async (origin) => {
     const response = await fetch(`${origin}/api/state?sourceId=${encodeURIComponent(sourceB)}`);

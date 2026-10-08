@@ -76,9 +76,24 @@ export interface HistoryQuery {
   cursor?: string;
   limit?: number;
   order?: "asc" | "desc";
+  playbackStatus?: "unattempted" | PlaybackAttemptState;
 }
 export interface CaptureContext { workspace?: { id: string; label: string }; tab?: { id: string; label: string }; pane?: { id: string; label?: string }; participant: { id: string; kind: string }; }
-export interface HistoryPage { announcements: Array<{ id: string; jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; result: SummaryResult; capture: CaptureContext; catchUp?: { status: "partial" | "complete"; reason: string } }>; nextCursor?: string; }
+export interface HistoryPage { announcements: Array<{ id: string; jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; result: SummaryResult; capture: CaptureContext; playback: { status: "unattempted" | PlaybackAttemptState; attemptId?: string; originGeneration?: number; authorizationGeneration?: number }; catchUp?: { status: "partial" | "complete"; reason: string } }>; nextCursor?: string; }
+export interface PlaybackSettings { master: { muted: boolean; volume: number; speed: number }; participants: Array<{ sourceId: SourceId; participantId: ParticipantId; muted: boolean; volume: number }>; }
+export interface PlaybackSettingsPatch { master?: Partial<PlaybackSettings["master"]>; participant?: { sourceId: SourceId; participantId: ParticipantId; muted?: boolean; volume?: number }; }
+export type MediaState = "pending" | "preparing" | "ready" | "failed";
+export interface PlaybackCandidate { itemId: string; kind: "announcement" | "recap"; jobId: string; announcementId?: string; sourceId: SourceId; workspaceId?: string; tabId?: string; participantId: ParticipantId; originGeneration: number; media: { state: MediaState; id?: string; url?: string }; playback: { status: "unattempted" | PlaybackAttemptState; attemptId?: string; originGeneration?: number; authorizationGeneration?: number }; createdAt: string; }
+export interface PlaybackCandidatesPage { scope: ListeningScope | null; candidates: PlaybackCandidate[]; nextCursor?: string; }
+export interface PlaybackCandidatesQuery { cursor?: string; limit?: number; order?: "asc" | "desc"; }
+export interface PreparePlaybackMedia { itemId: string; sourceId: SourceId; participantId: ParticipantId; scopeGeneration: number; }
+export type PreparePlaybackMediaOutcome = { kind: "prepare"; token: string; jobId: string; text: string } | { kind: "pending" } | { kind: "ready"; candidate: PlaybackCandidate } | { kind: "unknown" | "stale" };
+export type CompletePlaybackMediaOutcome = { kind: "ready"; candidate: PlaybackCandidate } | { kind: "failed"; candidate?: PlaybackCandidate } | { kind: "stale" };
+export type PlaybackIntent = "automatic" | "replay";
+export type PlaybackAttemptState = "prepared" | "started" | "heard" | "stopped" | "skipped" | "blocked" | "failed";
+export interface CreatePlaybackAttempt { attemptId: string; itemId: string; sourceId: SourceId; participantId: ParticipantId; scopeGeneration: number; intent: PlaybackIntent; }
+export type CreatePlaybackAttemptOutcome = { kind: "created" | "duplicate"; attempt: { attemptId: string; state: PlaybackAttemptState; mediaId: string; originGeneration: number; authorizationGeneration: number } } | { kind: "conflict" | "unknown" | "stale" };
+export type UpdatePlaybackAttemptOutcome = { kind: "updated" | "duplicate" } | { kind: "unknown" | "stale" | "invalid_transition" };
 export interface CatchUpRequest { sourceId: SourceId; generation: number; requestId: string; }
 export interface CatchUpEntry { status: "pending" | "complete" | "partial" | "unavailable" | "failed"; participantId: string; location: { sourceId: string; workspaceId?: string; tabId?: string; paneId?: string }; timestamp: string; evidenceRefs: string[]; text?: string; reason: string; }
 export interface CatchUpRecap { status: "pending" | "complete" | "partial" | "unavailable" | "failed"; requestId: string; generation: number; scope: ListeningScope; entries: CatchUpEntry[]; }
@@ -95,6 +110,16 @@ export interface Storage {
   requestCatchUp(request: CatchUpRequest): StorageEffect<CatchUpOutcome>;
   getState(query?: StateQuery): StorageEffect<StateDto>;
   getHistory(query: HistoryQuery): StorageEffect<HistoryPage>;
+  getPlaybackSettings(sourceId: SourceId): StorageEffect<PlaybackSettings | undefined>;
+  updatePlaybackSettings(patch: PlaybackSettingsPatch): StorageEffect<PlaybackSettings | undefined>;
+  getPlaybackCandidates(query: PlaybackCandidatesQuery): StorageEffect<PlaybackCandidatesPage>;
+  preparePlaybackMedia(request: PreparePlaybackMedia): StorageEffect<PreparePlaybackMediaOutcome>;
+  completePlaybackMedia(itemId: string, token: string, mediaId: string | undefined, failureCode?: string): StorageEffect<CompletePlaybackMediaOutcome>;
+  abandonPlaybackMedia(itemId: string, token: string): StorageEffect<void>;
+  getPlaybackMedia(mediaId: string): StorageEffect<{ mediaId: string } | undefined>;
+  createPlaybackAttempt(request: CreatePlaybackAttempt): StorageEffect<CreatePlaybackAttemptOutcome>;
+  updatePlaybackAttempt(attemptId: string, state: Exclude<PlaybackAttemptState, "prepared">, authorizationGeneration: number): StorageEffect<UpdatePlaybackAttemptOutcome>;
+  getPlaybackAttemptMedia(attemptId: string): StorageEffect<{ mediaId: string } | undefined>;
   getEventsSince(sequence: number): StorageEffect<EventsSinceOutcome>;
   prune(): StorageEffect<PruneResult>;
 }
@@ -226,12 +251,73 @@ function catchUpRecap(db: SQLiteAdapter, sourceId: SourceId, generation: number,
   return { status, requestId, generation, scope, entries };
 }
 
+type PlaybackCandidateRow = { rowid: number; job_id: string; source_id: string; participant_id: string; generation: number; result_json: string; capture_json: string; created_at: string; announcement_id: string | null; media_state: MediaState | null; media_id: string | null; attempt_id: string | null; attempt_state: PlaybackAttemptState | null; attempt_origin_generation: number | null; attempt_authorization_generation: number | null };
+
+const playbackCandidate = (row: PlaybackCandidateRow): PlaybackCandidate => {
+  const capture = historyCapture(JSON.parse(row.capture_json) as CaptureContext);
+  const media = row.media_state ?? "pending";
+  return {
+    itemId: row.announcement_id ?? `recap:${row.job_id}`,
+    kind: row.announcement_id ? "announcement" : "recap",
+    jobId: row.job_id,
+    ...(row.announcement_id ? { announcementId: row.announcement_id } : {}),
+    sourceId: row.source_id as SourceId,
+    ...(capture.workspace ? { workspaceId: capture.workspace.id } : {}),
+    ...(capture.tab ? { tabId: capture.tab.id } : {}),
+    participantId: row.participant_id as ParticipantId,
+    originGeneration: row.generation,
+    media: { state: media, ...(media === "ready" && row.media_id ? { id: row.media_id } : {}) },
+    playback: row.attempt_state ? { status: row.attempt_state, ...(row.attempt_id ? { attemptId: row.attempt_id } : {}), ...(row.attempt_origin_generation === null || row.attempt_origin_generation === undefined ? {} : { originGeneration: row.attempt_origin_generation }), ...(row.attempt_authorization_generation === null || row.attempt_authorization_generation === undefined ? {} : { authorizationGeneration: row.attempt_authorization_generation }) } : { status: "unattempted" },
+    createdAt: row.created_at,
+  };
+};
+
+function playbackCandidates(db: SQLiteAdapter, query: PlaybackCandidatesQuery, itemId?: string): PlaybackCandidatesPage {
+  const source = one<SourceRow>(db, "SELECT * FROM sources WHERE scope_json IS NOT NULL LIMIT 1");
+  const scope = source && currentScope(source);
+  if (!source || !scope) return { scope: null, candidates: [] };
+  const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
+  const direction = query.order === "asc" ? "ASC" : "DESC";
+  const currentLocation = `EXISTS (SELECT 1 FROM participants AS current
+    JOIN panes AS current_pane ON current_pane.pane_id = current.pane_id AND current_pane.present = 1
+    JOIN tabs AS current_tab ON current_tab.tab_id = current_pane.tab_id AND current_tab.present = 1
+    JOIN workspaces AS current_workspace ON current_workspace.workspace_id = current_tab.workspace_id AND current_workspace.present = 1
+    WHERE current.participant_id = jobs.participant_id AND current.source_id = jobs.source_id AND current.present = 1${scope.workspaceId ? " AND current_workspace.workspace_id = ?" : ""}${scope.tabId ? " AND current_tab.tab_id = ?" : ""})`;
+  const predicates = ["jobs.status = 'completed'", "jobs.result_json IS NOT NULL", "jobs.capture_json IS NOT NULL", "json_extract(jobs.result_json, '$.speak') = 1", "jobs.source_id = ?", currentLocation, "(announcements.announcement_id IS NOT NULL OR jobs.catch_up_request_id IS NOT NULL)", "(jobs.catch_up_request_id IS NULL OR NOT EXISTS (SELECT 1 FROM catch_up_entries AS entry LEFT JOIN jobs AS recap_job ON recap_job.job_id = entry.job_id WHERE entry.source_id = jobs.source_id AND entry.generation = jobs.generation AND entry.request_id = jobs.catch_up_request_id AND recap_job.status IN ('pending', 'leased') AND recap_job.expires_at > ?))"];
+  const values: unknown[] = [source.source_id, ...(scope.workspaceId ? [scope.workspaceId] : []), ...(scope.tabId ? [scope.tabId] : []), now()];
+  const add = (predicate: string, value: unknown) => { predicates.push(predicate); values.push(value); };
+  if (scope.workspaceId) add("json_extract(jobs.capture_json, '$.workspace.id') = ?", scope.workspaceId);
+  if (scope.tabId) add("json_extract(jobs.capture_json, '$.tab.id') = ?", scope.tabId);
+  if (itemId) {
+    if (itemId.startsWith("recap:")) add("jobs.job_id = ?", itemId.slice("recap:".length));
+    else add("announcements.announcement_id = ?", itemId);
+  }
+  if (query.cursor) add(`jobs.rowid ${direction === "ASC" ? ">" : "<"} ?`, Number(query.cursor));
+  const rows = all<PlaybackCandidateRow>(db, `SELECT jobs.rowid, jobs.job_id, jobs.source_id, jobs.participant_id, jobs.generation, jobs.result_json, jobs.capture_json, jobs.created_at, announcements.announcement_id, media_items.state AS media_state, media_items.media_id,
+    (SELECT attempt_id FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_id,
+    (SELECT state FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_state,
+    (SELECT origin_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_origin_generation,
+    (SELECT authorization_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_authorization_generation
+    FROM jobs LEFT JOIN announcements ON announcements.job_id = jobs.job_id LEFT JOIN media_items ON media_items.job_id = jobs.job_id
+    WHERE ${predicates.join(" AND ")} ORDER BY jobs.rowid ${direction} LIMIT ?`, ...values, itemId ? 1 : limit + 1);
+  const page = rows.slice(0, itemId ? 1 : limit);
+  return { scope, candidates: page.map((row) => playbackCandidate(row)), ...(itemId || rows.length <= limit ? {} : { nextCursor: String(page.at(-1)!.rowid) }) };
+}
+
+function playbackSettings(db: SQLiteAdapter, sourceId: SourceId): PlaybackSettings | undefined {
+  if (!one<{ source_id: string }>(db, "SELECT source_id FROM sources WHERE source_id = ?", sourceId)) return undefined;
+  const master = one<{ muted: number; volume: number; speed: number }>(db, "SELECT muted, volume, speed FROM playback_settings WHERE settings_key = 'global'") ?? { muted: 0, volume: 1, speed: 1 };
+  const participants = all<{ participant_id: string; muted: number | null; volume: number | null }>(db, "SELECT participant_id, muted, volume FROM playback_participant_settings WHERE source_id = ? ORDER BY participant_id", sourceId)
+    .map((row) => ({ sourceId, participantId: row.participant_id as ParticipantId, muted: row.muted === null ? false : Boolean(row.muted), volume: row.volume ?? 1 }));
+  return { master: { muted: Boolean(master.muted), volume: master.volume, speed: master.speed }, participants };
+}
+
 function event(db: SQLiteAdapter, kind: string, value: unknown): number {
   const change = db.run("INSERT INTO durable_events (kind, value_json, created_at) VALUES (?, ?, ?)", kind, JSON.stringify(value), now());
   return Number(change.lastInsertRowid);
 }
 
-async function pruneMedia(dataDir: string): Promise<number> {
+async function pruneMedia(dataDir: string, retained: ReadonlySet<string>): Promise<number> {
   const audio = join(dataDir, "audio");
   let entries: string[];
   try { entries = await readdir(audio); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
@@ -240,7 +326,8 @@ async function pruneMedia(dataDir: string): Promise<number> {
     const path = join(audio, name);
     const info = await stat(path);
     if (info.isDirectory()) continue;
-    if (name.endsWith(".partial") || name.endsWith(".tmp") || info.mtimeMs <= Date.now() - evidenceRetentionMs) {
+    const mediaId = name.endsWith(".mp3") ? name.slice(0, -4) : undefined;
+    if (name.endsWith(".partial") || name.endsWith(".tmp") || info.mtimeMs <= Date.now() - evidenceRetentionMs && (!mediaId || !retained.has(mediaId))) {
       await rm(path, { force: true });
       removed += 1;
     }
@@ -487,10 +574,26 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       const latestEvent = Number(one<{ value: number }>(db, "SELECT COALESCE(MAX(sequence), 0) AS value FROM durable_events")?.value ?? 0);
       return { sources: sources.map((item) => ({ sourceId: item.source_id as SourceId, stale: Boolean(item.stale) || stale(item.observed_at), observedAt: item.observed_at, topologySequence: item.topology_sequence, listeningGeneration: item.listening_generation })), topology, scope: active ? currentScope(active) : null, captureByParticipant, jobs: { pending: count("pending"), leased: count("leased"), completed: count("completed"), expired: count("expired") }, announcements: { count: Number(one<{ value: number }>(db, "SELECT COUNT(*) AS value FROM announcements")?.value ?? 0) }, eventSequence: Math.max(latestEvent, floor - 1) };
     })),
-    getHistory: (query) => safe("get history", () => {
+      getPlaybackSettings: (sourceId) => safe("get playback settings", () => playbackSettings(db, sourceId)),
+      updatePlaybackSettings: (patch) => safe("update playback settings", () => transaction(db, () => {
+        const timestamp = now();
+        if (patch.master) {
+          const current = one<{ muted: number; volume: number; speed: number }>(db, "SELECT muted, volume, speed FROM playback_settings WHERE settings_key = 'global'") ?? { muted: 0, volume: 1, speed: 1 };
+          db.run("INSERT INTO playback_settings (settings_key, muted, volume, speed, updated_at) VALUES ('global', ?, ?, ?, ?) ON CONFLICT(settings_key) DO UPDATE SET muted = excluded.muted, volume = excluded.volume, speed = excluded.speed, updated_at = excluded.updated_at", patch.master.muted === undefined ? current.muted : patch.master.muted ? 1 : 0, patch.master.volume ?? current.volume, patch.master.speed ?? current.speed, timestamp);
+        }
+        if (patch.participant) {
+          if (!one<{ source_id: string }>(db, "SELECT source_id FROM sources WHERE source_id = ?", patch.participant.sourceId)) return undefined;
+          const current = one<{ muted: number | null; volume: number | null }>(db, "SELECT muted, volume FROM playback_participant_settings WHERE source_id = ? AND participant_id = ?", patch.participant.sourceId, patch.participant.participantId) ?? { muted: null, volume: null };
+          db.run("INSERT INTO playback_participant_settings (source_id, participant_id, muted, volume, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_id, participant_id) DO UPDATE SET muted = excluded.muted, volume = excluded.volume, updated_at = excluded.updated_at", patch.participant.sourceId, patch.participant.participantId, patch.participant.muted === undefined ? current.muted : patch.participant.muted ? 1 : 0, patch.participant.volume ?? current.volume, timestamp);
+          return playbackSettings(db, patch.participant.sourceId);
+        }
+        const source = one<{ source_id: string }>(db, "SELECT source_id FROM sources WHERE scope_json IS NOT NULL ORDER BY source_id LIMIT 1") ?? one<{ source_id: string }>(db, "SELECT source_id FROM sources ORDER BY source_id LIMIT 1");
+        return source ? playbackSettings(db, source.source_id as SourceId) : undefined;
+      })),
+      getHistory: (query) => safe("get history", () => {
       const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
       const direction = query.order === "desc" ? "DESC" : "ASC";
-      const predicates = ["status = 'completed'", "result_json IS NOT NULL", "capture_json IS NOT NULL"];
+      const predicates = ["jobs.status = 'completed'", "jobs.result_json IS NOT NULL", "jobs.capture_json IS NOT NULL"];
       const values: unknown[] = [];
       const add = (predicate: string, value: unknown) => { predicates.push(predicate); values.push(value); };
       if (query.sourceId) add("source_id = ?", query.sourceId);
@@ -499,15 +602,103 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       if (query.participantId) add("participant_id = ?", query.participantId);
       if (query.from) add("created_at >= ?", query.from);
       if (query.to) add("created_at <= ?", query.to);
+      if (query.playbackStatus) add("COALESCE((SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1), 'unattempted') = ?", query.playbackStatus);
       if (query.cursor) add(`rowid ${direction === "DESC" ? "<" : ">"} ?`, Number(query.cursor));
-      const rows = all<{ rowid: number; job_id: string; source_id: string; participant_id: string; created_at: string; result_json: string; capture_json: string }>(db, `SELECT rowid, job_id, source_id, participant_id, created_at, result_json, capture_json FROM jobs WHERE ${predicates.join(" AND ")} ORDER BY rowid ${direction} LIMIT ?`, ...values, limit + 1);
+      const rows = all<{ rowid: number; job_id: string; source_id: string; participant_id: string; created_at: string; result_json: string; capture_json: string; attempt_id: string | null; attempt_state: PlaybackAttemptState | null; attempt_origin_generation: number | null; attempt_authorization_generation: number | null }>(db, `SELECT jobs.rowid, jobs.job_id, jobs.source_id, jobs.participant_id, jobs.created_at, jobs.result_json, jobs.capture_json,
+        (SELECT attempt_id FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_id,
+        (SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_state,
+        (SELECT origin_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_origin_generation,
+        (SELECT authorization_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_authorization_generation
+        FROM jobs WHERE ${predicates.join(" AND ")} ORDER BY jobs.rowid ${direction} LIMIT ?`, ...values, limit + 1);
       const page = rows.slice(0, limit);
       const ids = page.map((row) => row.job_id);
       const announcements = ids.length ? all<{ announcement_id: string; job_id: string; source_id: string; participant_id: string; created_at: string; summary_json: string }>(db, `SELECT announcement_id, job_id, source_id, participant_id, created_at, summary_json FROM announcements WHERE job_id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at`, ...ids) : [];
       const recapReasons = new Map((ids.length ? all<{ job_id: string; reason: string | null }>(db, `SELECT job_id, reason FROM catch_up_entries WHERE job_id IN (${ids.map(() => "?").join(",")})`, ...ids) : []).map((row) => [row.job_id, row.reason]));
-      return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: historyCapture(JSON.parse(row.capture_json) as CaptureContext), ...(recapReasons.has(row.job_id) ? { catchUp: { status: recapReasons.get(row.job_id) ? "partial" as const : "complete" as const, reason: recapReasons.get(row.job_id) ?? "complete" } } : {}) })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
-    }),
-    getEventsSince: (sequence) => safe("get events", () => {
+        return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: historyCapture(JSON.parse(row.capture_json) as CaptureContext), playback: row.attempt_state ? { status: row.attempt_state, ...(row.attempt_id ? { attemptId: row.attempt_id } : {}), ...(row.attempt_origin_generation === null ? {} : { originGeneration: row.attempt_origin_generation }), ...(row.attempt_authorization_generation === null ? {} : { authorizationGeneration: row.attempt_authorization_generation }) } : { status: "unattempted" as const }, ...(recapReasons.has(row.job_id) ? { catchUp: { status: recapReasons.get(row.job_id) ? "partial" as const : "complete" as const, reason: recapReasons.get(row.job_id) ?? "complete" } } : {}) })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
+      }),
+      getPlaybackCandidates: (query) => safe("get playback candidates", () => playbackCandidates(db, query)),
+      preparePlaybackMedia: (request) => safe("prepare playback media", () => transaction(db, () => {
+        const source = one<SourceRow>(db, "SELECT * FROM sources WHERE scope_json IS NOT NULL LIMIT 1");
+        const scope = source && currentScope(source);
+        const recap = request.itemId.startsWith("recap:");
+        const row = one<PlaybackCandidateRow>(db, `SELECT jobs.rowid, jobs.job_id, jobs.source_id, jobs.participant_id, jobs.generation, jobs.result_json, jobs.capture_json, jobs.created_at, announcements.announcement_id, media_items.state AS media_state, media_items.media_id
+          FROM jobs LEFT JOIN announcements ON announcements.job_id = jobs.job_id LEFT JOIN media_items ON media_items.job_id = jobs.job_id
+          WHERE jobs.status = 'completed' AND jobs.result_json IS NOT NULL AND jobs.capture_json IS NOT NULL AND json_extract(jobs.result_json, '$.speak') = 1 AND ${recap ? "jobs.job_id = ? AND jobs.catch_up_request_id IS NOT NULL" : "announcements.announcement_id = ?"}`, recap ? request.itemId.slice("recap:".length) : request.itemId);
+        const candidate = row && playbackCandidate(row);
+        const capture = row && historyCapture(JSON.parse(row.capture_json) as CaptureContext);
+        const location = scope && source && candidate && one<{ value: number }>(db, `SELECT 1 AS value FROM participants AS current JOIN panes AS pane ON pane.pane_id = current.pane_id AND pane.present = 1 JOIN tabs AS tab ON tab.tab_id = pane.tab_id AND tab.present = 1 JOIN workspaces AS workspace ON workspace.workspace_id = tab.workspace_id AND workspace.present = 1 WHERE current.participant_id = ? AND current.source_id = ? AND current.present = 1${scope.workspaceId ? " AND workspace.workspace_id = ?" : ""}${scope.tabId ? " AND tab.tab_id = ?" : ""}`, candidate?.participantId, source.source_id, ...(scope.workspaceId ? [scope.workspaceId] : []), ...(scope.tabId ? [scope.tabId] : []));
+        const capturedInScope = capture && scope && (scope.workspaceId ? capture.workspace?.id === scope.workspaceId : capture.tab?.id === scope.tabId);
+        if (!candidate || !scope || !location || !capturedInScope) return { kind: "unknown" };
+        if (candidate.sourceId !== request.sourceId || candidate.participantId !== request.participantId || scope.generation !== request.scopeGeneration) return { kind: "stale" };
+        const existing = one<{ state: MediaState; preparation_started_at: string | null }>(db, "SELECT state, preparation_started_at FROM media_items WHERE item_id = ?", candidate.itemId);
+        if (existing?.state === "ready") return { kind: "ready", candidate };
+        const expiredPreparation = existing?.state === "preparing" && existing.preparation_started_at !== null && Date.parse(existing.preparation_started_at) <= Date.now() - 60_000;
+        if (existing?.state === "preparing" && !expiredPreparation) return { kind: "pending" };
+        const token = randomUUID();
+        db.run("INSERT INTO media_items (item_id, job_id, state, media_id, preparation_token, preparation_started_at, preparation_generation, failure_code, updated_at) VALUES (?, ?, 'preparing', NULL, ?, ?, ?, NULL, ?) ON CONFLICT(item_id) DO UPDATE SET state = 'preparing', media_id = NULL, preparation_token = excluded.preparation_token, preparation_started_at = excluded.preparation_started_at, preparation_generation = excluded.preparation_generation, failure_code = NULL, updated_at = excluded.updated_at", candidate.itemId, candidate.jobId, token, now(), scope.generation, now());
+        const result = one<{ result_json: string }>(db, "SELECT result_json FROM jobs WHERE job_id = ?", candidate.jobId);
+        const text = result && (JSON.parse(result.result_json) as SummaryResult).text;
+        if (!text) throw new Error("Playable item has no speech text");
+        return { kind: "prepare", token, jobId: candidate.jobId, text };
+      })),
+      completePlaybackMedia: (itemId, token, mediaId, failureCode) => safe("complete playback media", () => transaction(db, () => {
+        const pending = one<{ source_id: SourceId; preparation_generation: number | null }>(db, "SELECT jobs.source_id, media_items.preparation_generation FROM media_items JOIN jobs ON jobs.job_id = media_items.job_id WHERE media_items.item_id = ? AND media_items.state = 'preparing' AND media_items.preparation_token = ?", itemId, token);
+        const source = pending && one<SourceRow>(db, "SELECT * FROM sources WHERE source_id = ? AND scope_json IS NOT NULL", pending.source_id);
+        const scope = source && currentScope(source);
+        if (!pending || !scope || pending.preparation_generation !== scope.generation) {
+          db.run("UPDATE media_items SET state = 'pending', preparation_token = NULL, preparation_started_at = NULL, updated_at = ? WHERE item_id = ? AND state = 'preparing' AND preparation_token = ?", now(), itemId, token);
+          return { kind: "stale" };
+        }
+        const result = db.run("UPDATE media_items SET state = ?, media_id = ?, failure_code = ?, preparation_token = NULL, preparation_started_at = NULL, updated_at = ? WHERE item_id = ? AND state = 'preparing' AND preparation_token = ?", mediaId ? "ready" : "failed", mediaId ?? null, mediaId ? null : failureCode ?? "provider_failed", now(), itemId, token);
+        if (!result.changes) return { kind: "stale" };
+        const candidate = playbackCandidates(db, { limit: 1 }, itemId).candidates[0];
+        return candidate ? mediaId ? { kind: "ready", candidate } : { kind: "failed", candidate } : { kind: "stale" };
+      })),
+      abandonPlaybackMedia: (itemId, token) => safe("abandon playback media", () => {
+        db.run("UPDATE media_items SET state = 'pending', preparation_token = NULL, preparation_started_at = NULL, updated_at = ? WHERE item_id = ? AND state = 'preparing' AND preparation_token = ?", now(), itemId, token);
+      }),
+      getPlaybackMedia: (mediaId) => safe("get playback media", () => one<{ media_id: string }>(db, "SELECT media_id FROM media_items WHERE media_id = ? AND state = 'ready'", mediaId) ? { mediaId } : undefined),
+      createPlaybackAttempt: (request) => safe("create playback attempt", () => transaction(db, () => {
+        const existing = one<{ item_id: string; source_id: string; participant_id: string; intent: PlaybackIntent; origin_generation: number; authorization_generation: number; state: PlaybackAttemptState; media_id: string | null }>(db, "SELECT attempts.item_id, attempts.source_id, attempts.participant_id, attempts.intent, attempts.origin_generation, attempts.authorization_generation, attempts.state, media_items.media_id FROM playback_attempts AS attempts JOIN media_items ON media_items.item_id = attempts.item_id WHERE attempts.attempt_id = ?", request.attemptId);
+        if (existing) {
+          if (existing.item_id !== request.itemId || existing.source_id !== request.sourceId || existing.participant_id !== request.participantId || existing.intent !== request.intent || existing.authorization_generation !== request.scopeGeneration) return { kind: "conflict" };
+          if (!existing.media_id) return { kind: "stale" };
+          return { kind: "duplicate", attempt: { attemptId: request.attemptId, state: existing.state, mediaId: existing.media_id, originGeneration: existing.origin_generation, authorizationGeneration: existing.authorization_generation } };
+        }
+        const source = one<SourceRow>(db, "SELECT * FROM sources WHERE scope_json IS NOT NULL LIMIT 1");
+        const scope = source && currentScope(source);
+        const candidate = playbackCandidates(db, { limit: 1 }, request.itemId).candidates[0];
+        if (!source || !scope || !candidate || candidate.sourceId !== request.sourceId || candidate.participantId !== request.participantId || scope.generation !== request.scopeGeneration || !candidate.media.id) return { kind: "stale" };
+        if (request.intent === "automatic" && candidate.originGeneration !== scope.generation) return { kind: "stale" };
+        const timestamp = now();
+        db.run("INSERT INTO playback_attempts (attempt_id, item_id, source_id, participant_id, intent, origin_generation, authorization_generation, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)", request.attemptId, request.itemId, request.sourceId, request.participantId, request.intent, candidate.originGeneration, scope.generation, timestamp, timestamp);
+        return { kind: "created", attempt: { attemptId: request.attemptId, state: "prepared", mediaId: candidate.media.id, originGeneration: candidate.originGeneration, authorizationGeneration: scope.generation } };
+      })),
+      updatePlaybackAttempt: (attemptId, state, authorizationGeneration) => safe("update playback attempt", () => transaction(db, () => {
+        const attempt = one<{ item_id: string; source_id: SourceId; participant_id: ParticipantId; authorization_generation: number; state: PlaybackAttemptState }>(db, "SELECT item_id, source_id, participant_id, authorization_generation, state FROM playback_attempts WHERE attempt_id = ?", attemptId);
+        if (!attempt) return { kind: "unknown" };
+        if (attempt.authorization_generation !== authorizationGeneration) return { kind: "stale" };
+        if (attempt.state === state) return { kind: "duplicate" };
+        const terminal = ["stopped", "skipped", "blocked", "failed"] as const;
+        if (state === "started" || state === "heard") {
+          const source = one<SourceRow>(db, "SELECT * FROM sources WHERE source_id = ? AND scope_json IS NOT NULL", attempt.source_id);
+          const scope = source && currentScope(source);
+          const candidate = playbackCandidates(db, { limit: 1 }, attempt.item_id).candidates[0];
+          if (!scope || !candidate || scope.generation !== authorizationGeneration) return { kind: "stale" };
+        }
+        if (state === "started" && attempt.state !== "prepared" || state === "heard" && attempt.state !== "started" || terminal.includes(state as typeof terminal[number]) && attempt.state !== "prepared" && attempt.state !== "started") return { kind: "invalid_transition" };
+        db.run("UPDATE playback_attempts SET state = ?, updated_at = ? WHERE attempt_id = ?", state, now(), attemptId);
+        return { kind: "updated" };
+      })),
+      getPlaybackAttemptMedia: (attemptId) => safe("get playback attempt media", () => {
+        const attempt = one<{ item_id: string; authorization_generation: number; state: PlaybackAttemptState }>(db, "SELECT item_id, authorization_generation, state FROM playback_attempts WHERE attempt_id = ?", attemptId);
+        if (!attempt || (attempt.state !== "prepared" && attempt.state !== "started")) return undefined;
+        const page = playbackCandidates(db, { limit: 1 }, attempt.item_id);
+        if (!page.scope || page.scope.generation !== attempt.authorization_generation) return undefined;
+        const mediaId = page.candidates[0]?.media.id;
+        return mediaId ? { mediaId } : undefined;
+      }),
+      getEventsSince: (sequence) => safe("get events", () => {
       const floor = Number(one<{ value: string }>(db, "SELECT value FROM storage_meta WHERE key = 'event_floor'")?.value ?? "1");
       if (sequence < floor - 1) return { kind: "expired" };
       const earliest = one<{ value: number | null }>(db, "SELECT MIN(sequence) AS value FROM durable_events")?.value;
@@ -517,8 +708,8 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       return { kind: "events", events: rows.map((row) => ({ sequence: row.sequence, kind: row.kind, value: JSON.parse(row.value_json) })), latestSequence };
     }),
     prune: () => Effect.tryPromise({ try: async () => {
-      const pruned = transaction(db, () => {
       const timestamp = now();
+      const pruned = transaction(db, () => {
       const pending = db.run("UPDATE jobs SET status = 'expired', evidence_json = NULL, capture_json = NULL, lease_token = NULL, lease_expires_at = NULL WHERE status IN ('pending', 'leased') AND expires_at <= ?", timestamp).changes;
       const evidence = db.run("UPDATE events SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET result_json = NULL, capture_json = NULL WHERE status = 'completed' AND terminal_expires_at IS NOT NULL AND terminal_expires_at <= ?", timestamp).changes;
       const history = db.run("DELETE FROM announcements WHERE expires_at <= ?", timestamp).changes;
@@ -532,7 +723,14 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       if (pending || history) event(db, "pruned", { pending, evidence, history });
       return { expiredEvidence: evidence, expiredHistory: history, expiredMedia: 0, terminalizedJobs: pending };
       });
-      return { ...pruned, expiredMedia: await pruneMedia(dataDir) };
+      const retained = new Set(all<{ media_id: string }>(db, `SELECT media.media_id FROM media_items AS media
+        JOIN jobs ON jobs.job_id = media.job_id
+        LEFT JOIN announcements ON announcements.job_id = jobs.job_id
+        WHERE media.state = 'ready' AND media.media_id IS NOT NULL
+          AND jobs.status = 'completed' AND jobs.result_json IS NOT NULL AND jobs.capture_json IS NOT NULL
+          AND jobs.terminal_expires_at > ? AND json_extract(jobs.result_json, '$.speak') = 1
+          AND (announcements.announcement_id IS NOT NULL OR jobs.catch_up_request_id IS NOT NULL)`, timestamp).map((row) => row.media_id));
+      return { ...pruned, expiredMedia: await pruneMedia(dataDir, retained) };
     }, catch: (cause) => new StorageError("prune", cause) }),
   };
 }

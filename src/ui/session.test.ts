@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
 import { BrowserApiError, type BrowserApi as BrowserApiContract, type EventNotification, type HistoryPage, type StateResponse } from "./api";
+import { createScopedPlaybackOwner } from "./playback";
 import { createBrowserSession } from "./session";
 
 const sourceA = "source-a";
 const sourceB = "source-b";
 const workspaceB = "workspace-b";
 const tabB = "tab-b";
-type BrowserApi = Omit<BrowserApiContract, "requestCatchUp"> & Partial<Pick<BrowserApiContract, "requestCatchUp">>;
+type BrowserApi = Pick<BrowserApiContract, "readState" | "readHistory" | "setListening" | "openEvents"> & Partial<Omit<BrowserApiContract, "readState" | "readHistory" | "setListening" | "openEvents">>;
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -51,6 +52,306 @@ afterEach(() => {
   sessions.clear();
 });
 
+test("playback state follows the confirmed joined scope rather than the browsed source", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async (sourceId) => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [{ sourceId, participantId: "participant-a", muted: false, volume: 1 }] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "pending" } }] }),
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceB);
+  await session.refreshPlayback();
+
+  expect(session.snapshot().selectedSourceId).toBe(sourceB);
+  expect(session.snapshot().playback).toMatchObject({ scope: joined, candidates: [{ sourceId: sourceA, media: { state: "pending" } }] });
+});
+
+test("a same-generation completion refreshes an empty joined candidate feed after SSE", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const completion = deferred<EventNotification>();
+  let completed = false;
+  let streams = 0;
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, completed ? 2 : 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => {
+      streams += 1;
+      if (streams === 1) return (async function*() { yield await completion.promise; })();
+      return idleEvents();
+    },
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: completed ? [{ itemId: "recap:job-a", kind: "recap", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "pending" } }] : [] }),
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.refreshPlayback();
+  expect(session.snapshot().playback?.candidates).toEqual([]);
+  completed = true;
+  completion.resolve({ id: 2, event: "completed" });
+
+  await eventually(() => expect(session.snapshot().playback?.candidates).toMatchObject([{ itemId: "recap:job-a", media: { state: "pending" } }]));
+});
+
+test("playback refresh traverses scoped candidate pages beyond the initial fifty", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const candidate = (index: number) => ({ itemId: `announcement:job-${index}`, kind: "announcement" as const, sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready" as const, id: "a".repeat(64) }, playback: { status: "unattempted" as const } });
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined), readHistory: async () => history(), setListening: async () => ({ scope: joined, generation: 7 }), openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async (query) => query?.cursor ? { scope: joined, candidates: [candidate(51)] } : { scope: joined, candidates: Array.from({ length: 50 }, (_, index) => candidate(index)), nextCursor: "after-50" },
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.refreshPlayback();
+
+  expect(session.snapshot().playback?.candidates).toHaveLength(51);
+  expect(session.snapshot().playback?.candidates.at(-1)?.itemId).toBe("announcement:job-51");
+});
+
+test("an SSE refreshes joined-source participants while browsing another source", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const replacement = deferred<EventNotification>();
+  let currentParticipant = "participant-old";
+  let streams = 0;
+  const sourceState = (sourceId: string) => {
+    const base = state(sourceId, streams + 1, joined);
+    if (sourceId !== sourceA) return base;
+    return {
+      ...base,
+      topology: {
+        ...base.topology!,
+        workspaces: [{ id: "workspace-a", sourceId: sourceA, label: "Workspace", order: 0, live: true }],
+        tabs: [{ id: "tab-a", workspaceId: "workspace-a", label: "Tab", order: 0 }],
+        panes: [{ id: "pane-a", tabId: "tab-a", terminalId: "terminal-a" }],
+        participants: [{ id: currentParticipant, sourceId: sourceA, paneId: "pane-a", rawPaneId: "raw-a", terminalId: "terminal-a", kind: "codex", generation: 1, active: true }],
+      },
+    } as StateResponse;
+  };
+  const api: BrowserApi = {
+    readState: async (sourceId) => sourceState(sourceId ?? sourceA),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => {
+      streams += 1;
+      if (streams === 2) return (async function*() { yield await replacement.promise; })();
+      return idleEvents();
+    },
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.selectSource(sourceB);
+  expect(session.snapshot().playbackAuthorization?.participantIds).toEqual(["participant-old"]);
+  currentParticipant = "participant-new";
+  replacement.resolve({ id: 3, event: "topology" });
+
+  await eventually(() => expect(session.snapshot().playbackAuthorization?.participantIds).toEqual(["participant-new"]));
+});
+
+test("playback session prepares pending media before it authorizes a client-owned attempt", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  let prepared = false;
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: prepared ? { state: "ready", id: "a".repeat(64) } : { state: "pending" } }] }),
+    preparePlaybackItem: async () => { prepared = true; return { media: { state: "ready", id: "a".repeat(64) } }; },
+    createPlaybackAttempt: async (attemptId) => ({ attemptId, state: "prepared", originGeneration: 7, authorizationGeneration: 7, mediaUrl: "/api/playback/attempts/attempt-a/media" }),
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.refreshPlayback();
+  await session.preparePlaybackItem("announcement:job-a");
+  const attempt = await session.authorizePlayback("announcement:job-a", "automatic", "attempt-a");
+
+  expect(session.snapshot().playback?.candidates[0]?.media.state).toBe("ready");
+  expect(attempt).toMatchObject({ attemptId: "attempt-a", mediaUrl: "/api/playback/attempts/attempt-a/media" });
+});
+
+test("a durable Heard receipt refreshes idle candidates and the active history filter without collector SSE", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  let heard = false;
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async (filters) => ({
+      announcements: heard && filters.playbackStatus === "heard"
+        ? [{ id: "announcement:job-a", jobId: "job-a", sourceId: sourceA, participantId: "participant-a", createdAt: "2026-10-08T12:00:00.000Z", summary: {}, playback: { status: "heard" as const } }]
+        : [],
+      results: [],
+    }),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready", id: "a".repeat(64) }, playback: { status: heard ? "heard" : "unattempted" } }] }),
+    updatePlaybackAttempt: async (attemptId, update) => {
+      heard = update.state === "heard";
+      return { attemptId, state: update.state, authorizationGeneration: update.authorizationGeneration };
+    },
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.setHistoryFilters({ order: "desc", limit: 50, playbackStatus: "heard" });
+  expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("unattempted");
+  expect(session.snapshot().history.announcements).toEqual([]);
+
+  await session.acknowledgePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 7 });
+
+  await eventually(() => expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("heard"));
+  await eventually(() => expect(session.snapshot().history.announcements).toMatchObject([{ playback: { status: "heard" } }]));
+});
+
+test("an accepted Started receipt lets an ended owner acknowledge Heard while a settings refresh is held", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const heldSettings = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: [] }>();
+  let settingsReads = 0;
+  const outcomes: string[] = [];
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ++settingsReads === 1 ? { master: { muted: false, volume: 1, speed: 1 }, participants: [] } : heldSettings.promise,
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready", id: "a".repeat(64) }, playback: { status: "started" } }] }),
+    updatePlaybackAttempt: async (attemptId, update) => {
+      outcomes.push(update.state);
+      return { attemptId, state: update.state, authorizationGeneration: update.authorizationGeneration };
+    },
+  };
+  const session = sessionFor(api);
+  let end: (() => void) | undefined;
+  const owner = createScopedPlaybackOwner({
+    createAudio: () => {
+      const audio = { onended: null as (() => void) | null, onerror: null as (() => void) | null, pause: () => undefined, play: async () => undefined, volume: 1, playbackRate: 1 };
+      end = () => audio.onended?.();
+      return audio;
+    },
+    report: (event) => session.acknowledgePlaybackAttempt(event.item.attemptId!, { state: event.outcome, authorizationGeneration: event.item.authorizationGeneration! }).then(() => undefined),
+  });
+
+  await session.start(sourceA);
+  owner.sync({ scope: joined, scopeStatus: "confirmed", participants: ["participant-a"], settings: { master: { muted: false, volume: 1, rate: 1 }, participants: {} } });
+  await owner.play({ id: "announcement:job-a", attemptId: "attempt-a", authorizationGeneration: 7, kind: "announcement", audioUrl: "/api/playback/attempts/attempt-a/media", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7 });
+  end?.();
+  await Bun.sleep(1);
+
+  expect(outcomes).toEqual(["started", "heard"]);
+  heldSettings.resolve({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+});
+
+test("a delayed playback settings read cannot undo an optimistic accepted mute", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const delayedRead = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: [] }>();
+  const delayedWrite = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: [] }>();
+  let delayReads = false;
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => delayReads ? delayedRead.promise : { master: { muted: false, volume: 1, speed: 1 }, participants: [] },
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [] }),
+    setPlaybackSettings: async () => delayedWrite.promise,
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  delayReads = true;
+  const staleRefresh = session.refreshPlayback();
+  const mute = session.setPlaybackSettings({ master: { muted: true } });
+  expect(session.snapshot().playback?.settings.master.muted).toBe(true);
+  delayedWrite.resolve({ master: { muted: true, volume: 1, speed: 1 }, participants: [] });
+  delayedRead.resolve({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+  await Promise.all([mute, staleRefresh]);
+
+  expect(session.snapshot().playback?.settings.master.muted).toBe(true);
+});
+
+test("a failed Leave reconciliation fences a late prepared attempt even when the generation is unchanged", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const receipt = deferred<{ attemptId: string; state: "prepared"; originGeneration: number; authorizationGeneration: number; mediaUrl: string }>();
+  const stopped: string[] = [];
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined), readHistory: async () => history(),
+    setListening: async () => { throw new TypeError("uncertain leave"); }, openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready", id: "a".repeat(64) }, playback: { status: "unattempted" } }] }),
+    createPlaybackAttempt: async () => receipt.promise,
+    updatePlaybackAttempt: async (attemptId, update) => { stopped.push(`${attemptId}:${update.state}`); return { attemptId, state: update.state, authorizationGeneration: update.authorizationGeneration }; },
+  };
+  const session = sessionFor(api);
+  await session.start(sourceA);
+  const pending = session.authorizePlayback("announcement:job-a", "automatic", "attempt-a");
+  await expect(session.leave()).rejects.toThrow("uncertain leave");
+  receipt.resolve({ attemptId: "attempt-a", state: "prepared", originGeneration: 7, authorizationGeneration: 7, mediaUrl: "/api/playback/attempts/attempt-a/media" });
+
+  await expect(pending).rejects.toThrow("Playback authorization was invalidated");
+  expect(stopped).toEqual(["attempt-a:stopped"]);
+});
+
+test("concurrent master and participant settings patches retain every optimistic change until accepted", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const mute = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: Array<{ sourceId: string; participantId: string; muted: boolean; volume: number }> }>();
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined), readHistory: async () => history(), setListening: async () => ({ scope: joined, generation: 7 }), openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [{ sourceId: sourceA, participantId: "participant-a", muted: false, volume: 1 }] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [] }),
+    setPlaybackSettings: async (patch) => patch.master ? mute.promise : { master: { muted: false, volume: 1, speed: 1 }, participants: [{ sourceId: sourceA, participantId: "participant-a", muted: false, volume: 0.4 }] },
+  };
+  const session = sessionFor(api);
+  await session.start(sourceA);
+  const master = session.setPlaybackSettings({ master: { muted: true } });
+  await session.setPlaybackSettings({ participant: { sourceId: sourceA, participantId: "participant-a", volume: 0.4 } });
+  expect(session.snapshot().playback?.settings.master.muted).toBe(true);
+  mute.resolve({ master: { muted: true, volume: 1, speed: 1 }, participants: [{ sourceId: sourceA, participantId: "participant-a", muted: false, volume: 1 }] });
+  await master;
+
+  expect(session.snapshot().playback?.settings).toMatchObject({ master: { muted: true }, participants: [{ participantId: "participant-a", volume: 0.4 }] });
+});
+
+test("a Join confirms a playback authorization and Leave fences the next generation", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1),
+    readHistory: async () => history(),
+    setListening: async (selection) => selection === null ? { scope: null, generation: 8 } : { scope: joined, generation: 7 },
+    openEvents: async () => idleEvents(),
+  };
+  const session = sessionFor(api);
+
+  await session.selectSource(sourceA);
+  await session.joinWorkspace(sourceA, "workspace-a");
+  expect(session.snapshot().playbackAuthorization).toEqual({ scope: joined, generation: 7, confirmed: true, participantIds: [] });
+  await session.leave();
+  expect(session.snapshot().playbackAuthorization).toEqual({ scope: null, generation: 8, confirmed: true, participantIds: [] });
+});
+
+test("session playback authorization names only exact current participant identities", async () => {
+  const api: BrowserApi = {
+    readState: async (sourceId) => ({ ...state(sourceId ?? sourceA, 1, { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 }), topology: { ...state(sourceId ?? sourceA, 1).topology!, workspaces: [{ id: "workspace-a", sourceId: sourceA, label: "Workspace", order: 0, live: true }], tabs: [{ id: "tab-a", workspaceId: "workspace-a", label: "Tab", order: 0 }], panes: [{ id: "pane-a", tabId: "tab-a", terminalId: "terminal-a" }], participants: [{ id: "participant-current", sourceId: sourceA, paneId: "pane-a", rawPaneId: "raw-a", terminalId: "terminal-a", kind: "codex", generation: 1, active: true }] } } as unknown as StateResponse),
+    readHistory: async () => history(),
+    setListening: async () => ({ scope: null, generation: 0 }),
+    openEvents: async () => idleEvents(),
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+
+  expect(session.snapshot().playbackAuthorization?.participantIds).toEqual(["participant-current"]);
+});
+
 test("browsing fences an obsolete source read without implicitly changing listening scope", async () => {
   const sourceARead = deferred<StateResponse>();
   const writes: Array<unknown> = [];
@@ -70,6 +371,7 @@ test("browsing fences an obsolete source read without implicitly changing listen
   expect(session.snapshot().selectedSourceId).toBe(sourceB);
   expect(session.snapshot().stateBySource[sourceA]).toBeUndefined();
   expect(session.snapshot().confirmedScope).toEqual({ sourceId: sourceA, tabId: "tab-a", generation: 1 });
+  expect(session.snapshot().playbackAuthorization).toEqual({ scope: { sourceId: sourceA, tabId: "tab-a", generation: 1 }, generation: 1, confirmed: true, participantIds: [] });
   expect(writes).toEqual([]);
   session.stop();
 });

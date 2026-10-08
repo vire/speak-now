@@ -1,6 +1,6 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
-import { connect } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -8,12 +8,20 @@ import { Database } from "bun:sqlite";
 import { Effect } from "effect";
 import { openStorage, type IngestBatch } from "../src/storage";
 
-const startServer = async (collectorToken?: string, options: { dataDirectory?: string; cwd?: string } = {}) => {
+const availablePort = async () => {
+  const reservation = createServer();
+  await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = (reservation.address() as AddressInfo).port;
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+  return port;
+};
+
+const startServer = async (collectorToken?: string, options: { dataDirectory?: string; cwd?: string; preload?: string; env?: Record<string, string> } = {}) => {
   const ownsDataDirectory = options.dataDirectory === undefined;
   const dataDirectory = options.dataDirectory ?? await mkdtemp(join(tmpdir(), "speak-now-server-api-"));
-  const port = 45_000 + Math.floor(Math.random() * 1_000);
-  const origin = `http://localhost:${port}`;
-  const server = Bun.spawn([Bun.which("bun")!, "src/server.ts"], {
+  const port = await availablePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const server = Bun.spawn([Bun.which("bun")!, ...(options.preload ? ["--preload", options.preload] : []), join(import.meta.dir, "../src/server.ts")], {
     cwd: options.cwd ?? process.cwd(),
     stdout: "ignore",
     stderr: "pipe",
@@ -21,7 +29,9 @@ const startServer = async (collectorToken?: string, options: { dataDirectory?: s
       ...process.env,
       PORT: String(port),
       SPEAK_NOW_DATA_DIR: dataDirectory,
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: join(dataDirectory, "transpiler-cache"),
       ...(collectorToken ? { SPEAK_NOW_COLLECTOR_TOKEN: collectorToken } : {}),
+      ...options.env,
     },
   });
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -35,7 +45,7 @@ const startServer = async (collectorToken?: string, options: { dataDirectory?: s
   server.kill();
   await server.exited;
   if (ownsDataDirectory) await rm(dataDirectory, { recursive: true, force: true });
-  throw new Error("server did not start");
+  throw new Error(`server did not start: ${await new Response(server.stderr).text()}`);
 };
 
 const stopServer = async ({ dataDirectory, server, ownsDataDirectory }: Awaited<ReturnType<typeof startServer>>, removeData = ownsDataDirectory) => {
@@ -107,6 +117,19 @@ const batch = (overrides: Record<string, unknown> = {}) => ({
 const postBatch = (origin: string, value: Record<string, unknown>) => fetch(`${origin}/api/collector/batches`, { method: "POST", headers: collectorHeaders, body: JSON.stringify(value) });
 const requestCatchUp = (origin: string, value: { sourceId: string; generation: number; requestId: string }) => fetch(`${origin}/api/catch-up`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
 
+test("playback settings rejects malformed supplied sections without mutating settings", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch())).status).toBe(201);
+    const url = `${runtime.origin}/api/playback/settings?sourceId=${encodeURIComponent(sourceId)}`;
+    for (const body of [{ master: null }, { participant: "bad" }, { master: { muted: true }, participant: "bad" }]) {
+      const response = await fetch(`${runtime.origin}/api/playback/settings`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      expect(response.status).toBe(400);
+      expect(await (await fetch(url)).json()).toEqual({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+    }
+  } finally { await stopServer(runtime); }
+}, 15_000);
+
 const activity = (id: string, cursor: string) => ({
   id,
   participantId,
@@ -120,6 +143,121 @@ const activity = (id: string, cursor: string) => ({
   excerpt: "full",
   originalTextBytes: 28,
 });
+
+test("completed remote normal and Catch up jobs prepare bounded scoped media on demand", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-media-"));
+  const preload = join(fixtureRoot, "speech-fixture.ts");
+  await writeFile(preload, `const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => String(input).startsWith("https://api.elevenlabs.io/") ? Promise.resolve(new Response(new Uint8Array([73, 68, 51]), { status: 200, headers: { "Content-Type": "audio/mpeg" } })) : originalFetch(input, init);`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice" } });
+  const complete = async (job: { jobId: string; leaseToken: string }, resultKey: string, text: string) => fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, {
+    method: "POST",
+    headers: collectorHeaders,
+    body: JSON.stringify({ leaseToken: job.leaseToken, resultKey, result: { speak: true, kind: "progress", text, evidenceEventIds: ["event-a"] } }),
+  });
+  const candidates = async (order: "asc" | "desc" = "asc") => {
+    const response = await fetch(`${runtime.origin}/api/playback/candidates?limit=1&order=${order}`);
+    expect(response.status).toBe(200);
+    return await response.json() as { candidates: Array<{ itemId: string; kind: "announcement" | "recap"; originGeneration: number; media: { state: "pending" | "ready" | "failed"; id?: string } }>; nextCursor?: string };
+  };
+  let scopeGeneration = 0;
+  const prepare = async (itemId: string) => {
+    const response = await fetch(`${runtime.origin}/api/playback/items/${itemId}/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceId, participantId, scopeGeneration }),
+    });
+    if (![200, 202].includes(response.status)) throw new Error(`expected prepared media, got ${response.status}: ${await response.text()} reports=${(await reports(runtime.dataDirectory)).join("|")}`);
+  };
+  const prepareAttempt = async (itemId: string, attemptId = "attempt-normal") => {
+    const response = await fetch(`${runtime.origin}/api/playback/attempts/${attemptId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemId, sourceId, participantId, scopeGeneration, intent: "automatic" }),
+    });
+    expect([200, 201]).toContain(response.status);
+    return await response.json() as { attemptId: string; authorizationGeneration: number; state: "prepared"; mediaUrl: string };
+  };
+  try {
+    expect((await postBatch(runtime.origin, batch())).status).toBe(201);
+    const settingsBefore = await fetch(`${runtime.origin}/api/playback/settings?sourceId=${encodeURIComponent(sourceId)}`);
+    expect(settingsBefore.status).toBe(200);
+    expect(await settingsBefore.json()).toEqual({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+    const masterSettings = await fetch(`${runtime.origin}/api/playback/settings`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ master: { muted: true, volume: 0.4, speed: 1.25 } }) });
+    expect(masterSettings.status).toBe(200);
+    expect(await masterSettings.json()).toEqual({ master: { muted: true, volume: 0.4, speed: 1.25 }, participants: [] });
+    const participantSettings = await fetch(`${runtime.origin}/api/playback/settings`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ participant: { sourceId, participantId, muted: true, volume: 0.3 } }) });
+    expect(participantSettings.status).toBe(200);
+    expect(await participantSettings.json()).toEqual({ master: { muted: true, volume: 0.4, speed: 1.25 }, participants: [{ sourceId, participantId, muted: true, volume: 0.3 }] });
+    const listening = await fetch(`${runtime.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceId, workspaceId }) });
+    expect(listening.status).toBe(200);
+    scopeGeneration = (await listening.json() as { generation: number }).generation;
+    expect((await postBatch(runtime.origin, batch({ batchId: "media-baseline", listeningGeneration: scopeGeneration, baselineReady: [participantId], cursors: [{ participantId, previous: "cursor-1", next: "cursor-2" }] }))).status).toBe(201);
+    expect((await postBatch(runtime.origin, batch({ batchId: "media-activity", listeningGeneration: scopeGeneration, cursors: [{ participantId, previous: "cursor-2", next: "cursor-3" }], activities: [activity("event-a", "cursor-3")] }))).status).toBe(201);
+    const claimedResponse = await fetch(`${runtime.origin}/api/collector/jobs/claim`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ workerId: "remote-worker" }) });
+    if (claimedResponse.status !== 200) throw new Error(`expected claimed job, got ${claimedResponse.status}: ${await claimedResponse.text()}`);
+    const normalClaim = await claimedResponse.json() as { jobId: string; leaseToken: string };
+    const normalCompleted = await complete(normalClaim, "remote-normal", "Normal remote summary");
+    if (normalCompleted.status !== 201) throw new Error(`expected completed normal job, got ${normalCompleted.status}: ${await normalCompleted.text()}`);
+    const normalPending = await candidates();
+    const normalItem = normalPending.candidates.at(0);
+    if (!normalItem) throw new Error("missing normal candidate");
+    expect(normalItem.kind).toBe("announcement");
+    expect(normalItem.originGeneration).toBe(1);
+    expect(normalItem.media).toEqual({ state: "pending" });
+    expect(normalItem.itemId).toEqual(expect.any(String));
+    expect(normalPending.nextCursor).toBeUndefined();
+    await prepare(normalItem.itemId);
+    const normalReady = await candidates();
+    const readyNormalItem = normalReady.candidates.at(0);
+    if (!readyNormalItem) throw new Error("missing ready normal candidate");
+    expect(readyNormalItem.media.state).toBe("ready");
+    expect(readyNormalItem.media.id).toMatch(/^[a-f0-9]{64}$/);
+    expect((await fetch(`${runtime.origin}/api/playback/media/${readyNormalItem.media.id}`)).status).toBe(404);
+    const normalAttempt = await prepareAttempt(readyNormalItem.itemId);
+    expect(normalAttempt).toEqual({ attemptId: "attempt-normal", originGeneration: scopeGeneration, authorizationGeneration: scopeGeneration, state: "prepared", mediaUrl: "/api/playback/attempts/attempt-normal/media" });
+    expect(await prepareAttempt(readyNormalItem.itemId)).toEqual(normalAttempt);
+    expect((await fetch(`${runtime.origin}${normalAttempt.mediaUrl}`)).status).toBe(200);
+    const started = await fetch(`${runtime.origin}/api/playback/attempts/${normalAttempt.attemptId}/status`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "started", authorizationGeneration: 1 }) });
+    expect(started.status).toBe(200);
+    expect(await started.json()).toEqual({ attemptId: "attempt-normal", authorizationGeneration: scopeGeneration, state: "started" });
+    const heard = await fetch(`${runtime.origin}/api/playback/attempts/${normalAttempt.attemptId}/status`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "heard", authorizationGeneration: 1 }) });
+    expect(heard.status).toBe(200);
+    expect(await heard.json()).toEqual({ attemptId: "attempt-normal", authorizationGeneration: scopeGeneration, state: "heard" });
+    const heardHistory = await fetch(`${runtime.origin}/api/history?sourceId=${encodeURIComponent(sourceId)}&playbackStatus=heard&limit=1`);
+    expect(heardHistory.status).toBe(200);
+    const heardPage = await heardHistory.json() as { results: Array<{ jobId: string; playback: { status: string; attemptId?: string } }> };
+    expect(heardPage.results[0]?.jobId).toBe(readyNormalItem.jobId);
+    expect(heardPage.results[0]?.playback).toEqual({ status: "heard", attemptId: "attempt-normal", originGeneration: scopeGeneration, authorizationGeneration: scopeGeneration });
+
+    expect((await requestCatchUp(runtime.origin, { sourceId, generation: 1, requestId: "media-recap" })).status).toBe(202);
+    const recapClaim = await (await fetch(`${runtime.origin}/api/collector/jobs/claim`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ workerId: "remote-worker" }) })).json() as { jobId: string; leaseToken: string };
+    expect((await complete(recapClaim, "remote-recap", "Remote recap summary")).status).toBe(201);
+    const recapPending = await candidates("desc");
+    const pendingRecapItem = recapPending.candidates.at(0);
+    if (!pendingRecapItem) throw new Error("missing recap candidate");
+    expect(pendingRecapItem.kind).toBe("recap");
+    expect(pendingRecapItem.media).toEqual({ state: "pending" });
+    await prepare(pendingRecapItem.itemId);
+    const recapReady = await candidates("desc");
+    const readyRecapItem = recapReady.candidates.at(0);
+    if (!readyRecapItem) throw new Error("missing ready recap candidate");
+    expect(readyRecapItem.kind).toBe("recap");
+    expect(readyRecapItem.media.state).toBe("ready");
+    expect(readyRecapItem.media.id).toEqual(expect.any(String));
+
+    const terminalAttempt = await prepareAttempt(readyNormalItem.itemId, "attempt-terminal");
+    expect((await fetch(`${runtime.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: "null" })).status).toBe(200);
+    const wrongTerminal = await fetch(`${runtime.origin}/api/playback/attempts/${terminalAttempt.attemptId}/status`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "stopped", authorizationGeneration: scopeGeneration + 1 }) });
+    expect(wrongTerminal.status).toBe(409);
+    const stopped = await fetch(`${runtime.origin}/api/playback/attempts/${terminalAttempt.attemptId}/status`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "stopped", authorizationGeneration: scopeGeneration }) });
+    expect(stopped.status).toBe(200);
+    const wrongDuplicate = await fetch(`${runtime.origin}/api/playback/attempts/${terminalAttempt.attemptId}/status`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "stopped", authorizationGeneration: scopeGeneration + 1 }) });
+    expect(wrongDuplicate.status).toBe(409);
+  } finally {
+    await stopServer(runtime);
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}, 15_000);
 
 const collectSseIds = async (response: Response, expectedCount: number) => {
   const reader = response.body?.getReader();
@@ -161,6 +299,87 @@ const prepareClaimedJob = async (origin: string) => {
   expect(claimed.status).toBe(200);
   return await claimed.json() as { jobId: string; leaseToken: string };
 };
+
+test("provider failure marks scoped media failed and leaves it retryable", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-provider-failure-"));
+  const preload = join(fixtureRoot, "speech-failure.ts");
+  await writeFile(preload, `const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => String(input).startsWith("https://api.elevenlabs.io/") ? Promise.resolve(new Response("unavailable", { status: 503 })) : originalFetch(input, init);`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice" } });
+  try {
+    const job = await prepareClaimedJob(runtime.origin);
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: job.leaseToken, resultKey: "provider-failure", result: { speak: true, kind: "progress", text: "Failure fixture", evidenceEventIds: ["event-a"] } }) })).status).toBe(201);
+    const candidates = await (await fetch(`${runtime.origin}/api/playback/candidates?limit=1`)).json() as { scope: { generation: number }; candidates: Array<{ itemId: string; media: { state: string } }> };
+    const candidate = candidates.candidates.at(0);
+    if (!candidate) throw new Error("missing provider failure candidate");
+    const request = { sourceId, participantId, scopeGeneration: candidates.scope.generation };
+    expect((await fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(candidate.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) })).status).toBe(503);
+    const failed = await (await fetch(`${runtime.origin}/api/playback/candidates?limit=1`)).json() as { candidates: Array<{ media: { state: string } }> };
+    expect(failed.candidates[0]?.media.state).toBe("failed");
+    expect((await fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(candidate.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) })).status).toBe(503);
+  } finally {
+    await stopServer(runtime);
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("provider failure after Leave returns stale_generation without leaving prepare unresolved", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-provider-leave-"));
+  const startedPath = join(fixtureRoot, "provider-started");
+  const releasePath = join(fixtureRoot, "provider-release");
+  const preload = join(fixtureRoot, "speech-leave.ts");
+  await writeFile(preload, `const originalFetch = globalThis.fetch; globalThis.fetch = async (input, init) => { if (!String(input).startsWith("https://api.elevenlabs.io/")) return originalFetch(input, init); await Bun.write(process.env.SPEECH_STARTED_PATH!, "started"); while (!(await Bun.file(process.env.SPEECH_RELEASE_PATH!).exists())) await Bun.sleep(5); return new Response("unavailable", { status: 503 }); };`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice", SPEECH_STARTED_PATH: startedPath, SPEECH_RELEASE_PATH: releasePath } });
+  try {
+    const job = await prepareClaimedJob(runtime.origin);
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: job.leaseToken, resultKey: "provider-leave", result: { speak: true, kind: "progress", text: "Leave failure fixture", evidenceEventIds: ["event-a"] } }) })).status).toBe(201);
+    const page = await (await fetch(`${runtime.origin}/api/playback/candidates?limit=1`)).json() as { scope: { generation: number }; candidates: Array<{ itemId: string }> };
+    const item = page.candidates.at(0);
+    if (!item) throw new Error("missing provider failure candidate");
+    const request = { sourceId, participantId, scopeGeneration: page.scope.generation };
+    const controller = new AbortController();
+    const pending = fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal: controller.signal });
+    for (let attempt = 0; attempt < 100 && !(await Bun.file(startedPath).exists()); attempt += 1) await Bun.sleep(5);
+    expect(await Bun.file(startedPath).exists()).toBe(true);
+    expect((await fetch(`${runtime.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: "null" })).status).toBe(200);
+    await writeFile(releasePath, "release");
+    const response = await Promise.race([pending, Bun.sleep(600).then(() => { controller.abort(); throw new Error("prepare did not settle after stale provider failure"); })]);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ code: "stale_generation" });
+  } finally {
+    await stopServer(runtime);
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("cancelled media preparation releases its token for an immediate scoped retry", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-provider-cancel-"));
+  const startedPath = join(fixtureRoot, "provider-started");
+  const abortedPath = join(fixtureRoot, "provider-aborted");
+  const preload = join(fixtureRoot, "speech-cancel.ts");
+  await writeFile(preload, `let calls = 0; const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => { if (!String(input).startsWith("https://api.elevenlabs.io/")) return originalFetch(input, init); calls += 1; if (calls > 1) return Promise.resolve(new Response(new Uint8Array([73, 68, 51]), { status: 200, headers: { "Content-Type": "audio/mpeg" } })); return Bun.write(process.env.SPEECH_STARTED_PATH!, "started").then(() => new Promise((resolve, reject) => init?.signal?.addEventListener("abort", () => Bun.write(process.env.SPEECH_ABORTED_PATH!, "aborted").then(() => reject(new DOMException("aborted", "AbortError"))), { once: true }))); };`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice", SPEECH_STARTED_PATH: startedPath, SPEECH_ABORTED_PATH: abortedPath } });
+  try {
+    const job = await prepareClaimedJob(runtime.origin);
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: job.leaseToken, resultKey: "provider-cancel", result: { speak: true, kind: "progress", text: "Cancellation fixture", evidenceEventIds: ["event-a"] } }) })).status).toBe(201);
+    const page = await (await fetch(`${runtime.origin}/api/playback/candidates?limit=1`)).json() as { scope: { generation: number }; candidates: Array<{ itemId: string }> };
+    const item = page.candidates.at(0);
+    if (!item) throw new Error("missing cancellation candidate");
+    const request = { sourceId, participantId, scopeGeneration: page.scope.generation };
+    const controller = new AbortController();
+    const pending = fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal: controller.signal });
+    for (let attempt = 0; attempt < 100 && !(await Bun.file(startedPath).exists()); attempt += 1) await Bun.sleep(5);
+    expect(await Bun.file(startedPath).exists()).toBe(true);
+    controller.abort();
+    await pending.catch(() => undefined);
+    const retry = await fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ media: { state: "ready" } });
+    expect(await Bun.file(abortedPath).exists()).toBe(true);
+  } finally {
+    await stopServer(runtime);
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}, 15_000);
 
 test("collector routes authenticate before parsing an invalid request", async () => {
   const runtime = await startServer("collector-test-token");

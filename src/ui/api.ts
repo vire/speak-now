@@ -33,23 +33,52 @@ export type HistoryFilters = {
   cursor?: string;
   limit?: number;
   order?: "asc" | "desc";
+  playbackStatus?: PlaybackStatus;
 };
 
+export type PlaybackStatus = "unattempted" | "prepared" | "started" | "heard" | "stopped" | "skipped" | "blocked" | "failed";
+export type PlaybackSettings = { master: { muted: boolean; volume: number; speed: number }; participants: Array<{ sourceId: string; participantId: string; muted: boolean; volume: number }> };
+export type PlaybackSettingsPatch = { master?: Partial<PlaybackSettings["master"]>; participant?: { sourceId: string; participantId: string; muted?: boolean; volume?: number } };
+export type PlaybackCandidate = { itemId: string; kind: "announcement" | "recap"; sourceId: string; workspaceId?: string; tabId?: string; participantId: string; originGeneration: number; createdAt: string; media: { state: "pending" | "preparing" | "ready" | "failed"; id?: string }; playback?: PlaybackRecord };
+export type PlaybackCandidates = { scope: ListeningScopeResponse | null; candidates: PlaybackCandidate[]; nextCursor?: string };
+export type PlaybackPrepareRequest = { sourceId: string; participantId: string; scopeGeneration: number };
+export type PlaybackAttemptRequest = { itemId: string; sourceId: string; participantId: string; scopeGeneration: number; intent: "automatic" | "replay" };
+export type PlaybackAttemptReceipt = { attemptId: string; state: "prepared" | "started" | "heard" | "stopped" | "skipped" | "blocked" | "failed"; originGeneration?: number; authorizationGeneration: number; mediaUrl?: string };
+
 export type HistoryPage = {
-  announcements: Array<{ id: string; jobId: string; sourceId: string; participantId: string; createdAt: string; summary: unknown }>;
-  results: Array<{ jobId: string; sourceId: string; participantId: string; createdAt: string; result: unknown; capture: unknown; catchUp?: { status: "partial" | "complete"; reason: string } }>;
+  announcements: Array<{ id: string; jobId: string; sourceId: string; participantId: string; createdAt: string; summary: unknown; playback?: PlaybackRecord }>;
+  results: Array<{ jobId: string; sourceId: string; participantId: string; createdAt: string; result: unknown; capture: unknown; catchUp?: { status: "partial" | "complete"; reason: string }; playback?: PlaybackRecord }>;
   nextCursor?: string;
 };
+
+export type PlaybackRecord = { status: PlaybackStatus; attemptId?: string; originGeneration?: number; authorizationGeneration?: number };
 
 export type ListeningSelection = { sourceId: string; workspaceId: string } | { sourceId: string; tabId: string } | null;
 export type EventNotification = { id: number; event: string };
 export type BrowserFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+const playbackPath = (segment: string) => encodeURIComponent(segment);
+export const playbackRoutes = {
+  settings: () => "/api/playback/settings",
+  candidates: () => "/api/playback/candidates",
+  prepare: (itemId: string) => `/api/playback/items/${playbackPath(itemId)}/prepare`,
+  attempts: () => "/api/playback/attempts",
+  attempt: (attemptId: string) => `/api/playback/attempts/${playbackPath(attemptId)}`,
+  attemptStatus: (attemptId: string) => `/api/playback/attempts/${playbackPath(attemptId)}/status`,
+  media: (mediaId: string) => `/api/playback/media/${playbackPath(mediaId)}`,
+};
 
 export interface BrowserApi {
   readState(sourceId?: string, signal?: AbortSignal): Promise<StateResponse>;
   readHistory(filters: HistoryFilters, signal?: AbortSignal): Promise<HistoryPage>;
   setListening(selection: ListeningSelection, signal?: AbortSignal): Promise<{ scope: ListeningScopeResponse | null; generation: number }>;
   requestCatchUp(request: CatchUpRequest, signal?: AbortSignal): Promise<CatchUpResponse>;
+  readPlaybackSettings(sourceId: string, signal?: AbortSignal): Promise<PlaybackSettings>;
+  setPlaybackSettings(patch: PlaybackSettingsPatch, signal?: AbortSignal): Promise<PlaybackSettings>;
+  readPlaybackCandidates(query?: { limit?: number; cursor?: string; order?: "asc" | "desc" }, signal?: AbortSignal): Promise<PlaybackCandidates>;
+  preparePlaybackItem(itemId: string, request: PlaybackPrepareRequest, signal?: AbortSignal): Promise<{ media: PlaybackCandidate["media"] }>;
+  createPlaybackAttempt(attemptId: string, request: PlaybackAttemptRequest, signal?: AbortSignal): Promise<PlaybackAttemptReceipt>;
+  updatePlaybackAttempt(attemptId: string, update: { state: Exclude<PlaybackStatus, "unattempted" | "prepared">; authorizationGeneration: number }, signal?: AbortSignal): Promise<PlaybackAttemptReceipt>;
   openEvents(cursor: number, signal?: AbortSignal): Promise<AsyncIterable<EventNotification>>;
 }
 
@@ -78,6 +107,12 @@ const boolean = (value: unknown): value is boolean => typeof value === "boolean"
 const nonnegativeInteger = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const array = (value: unknown): value is unknown[] => Array.isArray(value);
+const playbackStatus = (value: unknown): value is PlaybackStatus => ["unattempted", "prepared", "started", "heard", "stopped", "skipped", "blocked", "failed"].includes(value as string);
+
+const playbackRecord = (value: unknown): value is PlaybackRecord => {
+  const body = record(value);
+  return Boolean(body && playbackStatus(body.status) && (!has(body, "attemptId") || identifier(body.attemptId)) && (!has(body, "originGeneration") || nonnegativeInteger(body.originGeneration)) && (!has(body, "authorizationGeneration") || nonnegativeInteger(body.authorizationGeneration)));
+};
 
 const scope = (value: unknown): value is ListeningScopeResponse => {
   const body = record(value);
@@ -148,12 +183,12 @@ const historyResponse = async (response: Response): Promise<HistoryPage> => {
   const results = value?.results;
   const announcement = (item: unknown) => {
     const row = record(item);
-    return Boolean(row && string(row.id) && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "summary"));
+    return Boolean(row && string(row.id) && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "summary") && (!has(row, "playback") || playbackRecord(row.playback)));
   };
   const result = (item: unknown) => {
     const row = record(item);
     const recap = row && record(row.catchUp);
-    return Boolean(row && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "result") && has(row, "capture") && (!has(row, "catchUp") || recap && (recap.status === "partial" || recap.status === "complete") && string(recap.reason)));
+    return Boolean(row && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "result") && has(row, "capture") && (!has(row, "catchUp") || recap && (recap.status === "partial" || recap.status === "complete") && string(recap.reason)) && (!has(row, "playback") || playbackRecord(row.playback)));
   };
   if (!value || !array(announcements) || !announcements.every(announcement) || !array(results) || !results.every(result) || !optionalString(value.nextCursor)) throw new BrowserApiError("malformed_response");
   return value as HistoryPage;
@@ -182,6 +217,48 @@ const catchUpResponse = async (response: Response): Promise<CatchUpResponse> => 
   };
   if (!body || !["pending", "partial", "complete", "unavailable", "failed"].includes(body.status as string) || !identifier(body.requestId) || !nonnegativeInteger(body.generation) || !scope(body.scope) || body.scope.generation !== body.generation || !array(entries) || !entries.every(entry)) throw new BrowserApiError("malformed_response");
   return body as CatchUpResponse;
+};
+
+const playbackSettingsResponse = async (response: Response): Promise<PlaybackSettings> => {
+  const body = record(await json(response));
+  const master = body && record(body.master);
+  const participants = body?.participants;
+  const validSettings = (value: Record<string, unknown> | undefined) => Boolean(value && boolean(value.muted) && finiteNumber(value.volume) && value.volume >= 0 && value.volume <= 1 && finiteNumber(value.speed) && value.speed >= 0.5 && value.speed <= 2);
+  const validParticipant = (value: unknown) => {
+    const participant = record(value);
+    return Boolean(participant && identifier(participant.sourceId) && identifier(participant.participantId) && boolean(participant.muted) && finiteNumber(participant.volume) && participant.volume >= 0 && participant.volume <= 1);
+  };
+  if (!body || !validSettings(master) || !array(participants) || !participants.every(validParticipant)) throw new BrowserApiError("malformed_response");
+  return body as PlaybackSettings;
+};
+
+const playbackMedia = (value: unknown): value is PlaybackCandidate["media"] => {
+  const media = record(value);
+  if (!media || !["pending", "preparing", "ready", "failed"].includes(media.state as string) || (!has(media, "id") && media.state === "ready") || (has(media, "id") && !identifier(media.id))) return false;
+  return true;
+};
+
+const playbackCandidatesResponse = async (response: Response): Promise<PlaybackCandidates> => {
+  const body = record(await json(response));
+  const candidates = body?.candidates;
+  const candidate = (value: unknown) => {
+    const item = record(value);
+    return Boolean(item && identifier(item.itemId) && (item.kind === "announcement" || item.kind === "recap") && identifier(item.sourceId) && (!has(item, "workspaceId") || identifier(item.workspaceId)) && (!has(item, "tabId") || identifier(item.tabId)) && identifier(item.participantId) && nonnegativeInteger(item.originGeneration) && string(item.createdAt) && playbackMedia(item.media) && (!has(item, "playback") || playbackRecord(item.playback)));
+  };
+  if (!body || !nullableScope(body.scope) || !array(candidates) || !candidates.every(candidate) || !optionalString(body.nextCursor)) throw new BrowserApiError("malformed_response");
+  return body as PlaybackCandidates;
+};
+
+const playbackPrepareResponse = async (response: Response): Promise<{ media: PlaybackCandidate["media"] }> => {
+  const body = record(await json(response));
+  if (!body || !playbackMedia(body.media)) throw new BrowserApiError("malformed_response");
+  return body as { media: PlaybackCandidate["media"] };
+};
+
+const playbackAttemptResponse = async (response: Response): Promise<PlaybackAttemptReceipt> => {
+  const body = record(await json(response));
+  if (!body || !identifier(body.attemptId) || !playbackStatus(body.state) || !nonnegativeInteger(body.authorizationGeneration) || (!has(body, "originGeneration") && body.state === "prepared") || (has(body, "originGeneration") && !nonnegativeInteger(body.originGeneration)) || (has(body, "mediaUrl") && !identifier(body.mediaUrl))) throw new BrowserApiError("malformed_response");
+  return body as PlaybackAttemptReceipt;
 };
 
 const append = (parameters: URLSearchParams, name: string, value: string | number | undefined) => {
@@ -241,6 +318,7 @@ export const createBrowserApi = (fetcher: BrowserFetch = fetch): BrowserApi => (
     append(parameters, "order", filters.order);
     append(parameters, "cursor", filters.cursor);
     append(parameters, "limit", filters.limit);
+    append(parameters, "playbackStatus", filters.playbackStatus);
     return historyResponse(await fetcher(`/api/history${parameters.size ? `?${parameters}` : ""}`, { signal }));
   },
   async setListening(selection, signal) {
@@ -253,6 +331,33 @@ export const createBrowserApi = (fetcher: BrowserFetch = fetch): BrowserApi => (
   },
   async requestCatchUp(request, signal) {
     return catchUpResponse(await fetcher("/api/catch-up", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal }));
+  },
+  async readPlaybackSettings(sourceId, signal) {
+    const parameters = new URLSearchParams({ sourceId });
+    return playbackSettingsResponse(await fetcher(`${playbackRoutes.settings()}?${parameters}`, { signal }));
+  },
+  async setPlaybackSettings(patch, signal) {
+    return playbackSettingsResponse(await fetcher(playbackRoutes.settings(), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch), signal }));
+  },
+  async readPlaybackCandidates(query = {}, signal) {
+    const parameters = new URLSearchParams();
+    append(parameters, "limit", query.limit);
+    append(parameters, "cursor", query.cursor);
+    append(parameters, "order", query.order);
+    return playbackCandidatesResponse(await fetcher(`${playbackRoutes.candidates()}${parameters.size ? `?${parameters}` : ""}`, { signal }));
+  },
+  async preparePlaybackItem(itemId, request, signal) {
+    return playbackPrepareResponse(await fetcher(playbackRoutes.prepare(itemId), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal }));
+  },
+  async createPlaybackAttempt(attemptId, request, signal) {
+    const receipt = await playbackAttemptResponse(await fetcher(playbackRoutes.attempt(attemptId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal }));
+    if (receipt.attemptId !== attemptId || receipt.authorizationGeneration !== request.scopeGeneration || receipt.state !== "prepared" || receipt.originGeneration === undefined || !receipt.mediaUrl) throw new BrowserApiError("malformed_response");
+    return receipt;
+  },
+  async updatePlaybackAttempt(attemptId, update, signal) {
+    const receipt = await playbackAttemptResponse(await fetcher(playbackRoutes.attemptStatus(attemptId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(update), signal }));
+    if (receipt.attemptId !== attemptId || receipt.authorizationGeneration !== update.authorizationGeneration || receipt.state !== update.state) throw new BrowserApiError("malformed_response");
+    return receipt;
   },
   async openEvents(cursor, signal) {
     const response = await fetcher("/api/events", { headers: { "Last-Event-ID": String(cursor) }, signal });

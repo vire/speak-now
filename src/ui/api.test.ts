@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { BrowserApiError, createBrowserApi, type BrowserFetch, type HistoryPage, type StateResponse } from "./api";
+import { BrowserApiError, createBrowserApi, playbackRoutes, type BrowserFetch, type HistoryPage, type StateResponse } from "./api";
 
 const sourceId = "source /?&=one";
 const tabId = "tab /?&=two";
@@ -22,6 +22,70 @@ const eventFrame = ["id: 8", "event: ingested", "data: ignored", "", ""].join(St
 const consume = async (events: AsyncIterable<unknown>) => {
   for await (const _ of events) undefined;
 };
+
+test("frozen playback routes encode opaque item, attempt, and media IDs without selecting an audio DTO", () => {
+  expect(playbackRoutes.settings()).toBe("/api/playback/settings");
+  expect(playbackRoutes.candidates()).toBe("/api/playback/candidates");
+  expect(playbackRoutes.prepare("item /?&=one")).toBe("/api/playback/items/item%20%2F%3F%26%3Done/prepare");
+  expect(playbackRoutes.attempts()).toBe("/api/playback/attempts");
+  expect(playbackRoutes.attempt("attempt /?&=two")).toBe("/api/playback/attempts/attempt%20%2F%3F%26%3Dtwo");
+  expect(playbackRoutes.media("a".repeat(64))).toBe(`/api/playback/media/${"a".repeat(64)}`);
+});
+
+test("browser playback transport prepares pending media before it creates and confirms a client-owned attempt", async () => {
+  const source = "source-a";
+  const participant = "participant-a";
+  const itemId = "recap:job-a";
+  const attemptId = "attempt-a";
+  const requests: Array<{ url: URL; init?: RequestInit }> = [];
+  const api = createBrowserApi(async (input, init) => {
+    const url = new URL(String(input), "http://speak-now.test");
+    requests.push({ url, init });
+    if (url.pathname === "/api/playback/settings" && !init?.method) return Response.json({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+    if (url.pathname === "/api/playback/candidates") return Response.json({ scope: { sourceId: source, workspaceId: "workspace-a", generation: 4 }, candidates: [{ itemId, kind: "recap", sourceId: source, workspaceId: "workspace-a", participantId: participant, originGeneration: 2, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "pending" } }] });
+    if (url.pathname.endsWith("/prepare")) return Response.json({ media: { state: "ready", id: "b".repeat(64) } });
+    if (url.pathname === `/api/playback/attempts/${attemptId}`) return Response.json({ attemptId, state: "prepared", originGeneration: 2, authorizationGeneration: 4, mediaUrl: `/api/playback/attempts/${attemptId}/media` }, { status: 201 });
+    if (url.pathname === `/api/playback/attempts/${attemptId}/status`) return Response.json({ attemptId, state: "started", authorizationGeneration: 4 });
+    throw new Error(`unexpected route ${url.pathname}`);
+  });
+
+  await expect(api.readPlaybackSettings(source)).resolves.toMatchObject({ master: { speed: 1 } });
+  await expect(api.readPlaybackCandidates({ limit: 10, order: "desc" })).resolves.toMatchObject({ candidates: [{ itemId, media: { state: "pending" } }] });
+  await expect(api.preparePlaybackItem(itemId, { sourceId: source, participantId: participant, scopeGeneration: 4 })).resolves.toMatchObject({ media: { state: "ready" } });
+  await expect(api.createPlaybackAttempt(attemptId, { itemId, sourceId: source, participantId: participant, scopeGeneration: 4, intent: "replay" })).resolves.toMatchObject({ state: "prepared", mediaUrl: `/api/playback/attempts/${attemptId}/media` });
+  await expect(api.updatePlaybackAttempt(attemptId, { state: "started", authorizationGeneration: 4 })).resolves.toMatchObject({ state: "started" });
+
+  expect(requests.map(({ url, init }) => ({ path: `${url.pathname}${url.search}`, method: init?.method, body: init?.body }))).toEqual([
+    { path: `/api/playback/settings?sourceId=${source}`, method: undefined, body: undefined },
+    { path: "/api/playback/candidates?limit=10&order=desc", method: undefined, body: undefined },
+    { path: `/api/playback/items/${encodeURIComponent(itemId)}/prepare`, method: "POST", body: JSON.stringify({ sourceId: source, participantId: participant, scopeGeneration: 4 }) },
+    { path: `/api/playback/attempts/${attemptId}`, method: "PUT", body: JSON.stringify({ itemId, sourceId: source, participantId: participant, scopeGeneration: 4, intent: "replay" }) },
+    { path: `/api/playback/attempts/${attemptId}/status`, method: "PUT", body: JSON.stringify({ state: "started", authorizationGeneration: 4 }) },
+  ]);
+});
+
+const validPlaybackSettings = { master: { muted: false, volume: 1, speed: 1 }, participants: [] };
+const validPreparedReceipt = { attemptId: "attempt-a", state: "prepared", originGeneration: 4, authorizationGeneration: 4, mediaUrl: "/api/playback/attempts/attempt-a/media" };
+const validHeardReceipt = { attemptId: "attempt-a", state: "heard", authorizationGeneration: 4 };
+
+for (const invalid of [
+  { name: "unsafe master volume", settings: { ...validPlaybackSettings, master: { ...validPlaybackSettings.master, volume: 2 } }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.readPlaybackSettings("source-a") },
+  { name: "unsafe master speed", settings: { ...validPlaybackSettings, master: { ...validPlaybackSettings.master, speed: 3 } }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.readPlaybackSettings("source-a") },
+  { name: "prepared receipt attempt ID", prepared: { ...validPreparedReceipt, attemptId: "attempt-other" }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.createPlaybackAttempt("attempt-a", { itemId: "announcement:job-a", sourceId: "source-a", participantId: "participant-a", scopeGeneration: 4, intent: "automatic" }) },
+  { name: "terminal receipt state", status: { ...validHeardReceipt, state: "started" }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.updatePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 4 }) },
+  { name: "terminal receipt authorization generation", status: { ...validHeardReceipt, authorizationGeneration: 5 }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.updatePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 4 }) },
+]) {
+  test(`browser playback transport rejects one invalid ${invalid.name} field with otherwise valid data`, async () => {
+    const api = createBrowserApi(async (input) => {
+      const path = new URL(String(input), "http://speak-now.test").pathname;
+      if (path === "/api/playback/settings") return Response.json(invalid.settings ?? validPlaybackSettings);
+      if (path.endsWith("/status")) return Response.json(invalid.status ?? validHeardReceipt);
+      return Response.json(invalid.prepared ?? validPreparedReceipt);
+    });
+
+    await expect(invalid.invoke(api)).rejects.toMatchObject({ code: "malformed_response" });
+  });
+}
 
 test("browser API encodes opaque IDs and sends each endpoint its own public DTO", async () => {
   const requests: Array<{ url: URL; init?: RequestInit }> = [];
