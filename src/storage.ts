@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { migrations } from "./migrations";
-import type { Activity, ListeningScope, ParticipantId, SourceId, Topology, TraceContext, WorkspaceId, TabId } from "./shared";
+import { formatEvidence, type Activity, type ListeningScope, type ParticipantId, type SourceId, type Topology, type TraceContext, type WorkspaceId, type TabId } from "./shared";
 
 const evidenceRetentionMs = 24 * 60 * 60 * 1_000;
 const historyRetentionMs = 30 * 24 * 60 * 60 * 1_000;
@@ -78,7 +78,11 @@ export interface HistoryQuery {
   order?: "asc" | "desc";
 }
 export interface CaptureContext { workspace?: { id: string; label: string }; tab?: { id: string; label: string }; pane?: { id: string; label?: string }; participant: { id: string; kind: string }; }
-export interface HistoryPage { announcements: Array<{ id: string; jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; result: SummaryResult; capture: CaptureContext }>; nextCursor?: string; }
+export interface HistoryPage { announcements: Array<{ id: string; jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; summary: SummaryResult }>; results: Array<{ jobId: string; sourceId: SourceId; participantId: ParticipantId; createdAt: string; result: SummaryResult; capture: CaptureContext; catchUp?: { status: "partial" | "complete"; reason: string } }>; nextCursor?: string; }
+export interface CatchUpRequest { sourceId: SourceId; generation: number; requestId: string; }
+export interface CatchUpEntry { status: "pending" | "complete" | "partial" | "unavailable" | "failed"; participantId: string; location: { sourceId: string; workspaceId?: string; tabId?: string; paneId?: string }; timestamp: string; evidenceRefs: string[]; text?: string; reason: string; }
+export interface CatchUpRecap { status: "pending" | "complete" | "partial" | "unavailable" | "failed"; requestId: string; generation: number; scope: ListeningScope; entries: CatchUpEntry[]; }
+export type CatchUpOutcome = { kind: "accepted" | "duplicate"; recap: CatchUpRecap } | { kind: "no_joined_scope" | "stale_generation" };
 export type EventsSinceOutcome = { kind: "events"; events: Array<{ sequence: number; kind: string; value: unknown }>; latestSequence: number } | { kind: "expired" };
 export interface PruneResult { expiredEvidence: number; expiredHistory: number; expiredMedia: number; terminalizedJobs: number; }
 
@@ -88,6 +92,7 @@ export interface Storage {
   claimJob(workerId: string): StorageEffect<ClaimJobOutcome>;
   completeJob(jobId: string, completion: JobCompletion): StorageEffect<CompleteJobOutcome>;
   setListeningScope(selection: ListeningSelection): StorageEffect<SetListeningScopeOutcome>;
+  requestCatchUp(request: CatchUpRequest): StorageEffect<CatchUpOutcome>;
   getState(query?: StateQuery): StorageEffect<StateDto>;
   getHistory(query: HistoryQuery): StorageEffect<HistoryPage>;
   getEventsSince(sequence: number): StorageEffect<EventsSinceOutcome>;
@@ -97,7 +102,7 @@ export interface Storage {
 type SourceRow = { source_id: string; epoch: string; topology_sequence: number; topology_digest: string; observed_at: string; stale: number; listening_generation: number; scope_json: string | null };
 type CursorRow = { source_id: string; cursor_value: string; baseline_generation: number | null };
 type EventRow = { digest: string };
-type JobRow = { job_id: string; source_id: string; participant_id: string; generation: number; evidence_json: string | null; status: string; attempts: number; lease_token: string | null; lease_expires_at: string | null; completion_lease_token: string | null; result_key: string | null; result_digest: string | null; result_json: string | null; capture_json: string | null; receipt_json: string | null; expires_at: string; terminal_expires_at: string | null; terminal_outcome: string | null };
+type JobRow = { job_id: string; source_id: string; participant_id: string; generation: number; evidence_json: string | null; status: string; attempts: number; lease_token: string | null; lease_expires_at: string | null; completion_lease_token: string | null; result_key: string | null; result_digest: string | null; result_json: string | null; capture_json: string | null; receipt_json: string | null; expires_at: string; terminal_expires_at: string | null; terminal_outcome: string | null; catch_up_request_id: string | null };
 
 const now = () => new Date().toISOString();
 const after = (milliseconds: number) => new Date(Date.now() + milliseconds).toISOString();
@@ -193,6 +198,34 @@ function historyCapture(capture: CaptureContext): CaptureContext {
   };
 }
 
+const captureInScope = (capture: CaptureContext, scope: ListeningScope) => Boolean(capture.workspace && (!scope.workspaceId || capture.workspace.id === scope.workspaceId) && (!scope.tabId || capture.tab?.id === scope.tabId));
+const recapText = (result: SummaryResult, evidenceIds: string[]) => {
+  const words = result.text.trim().split(/\s+/).filter(Boolean);
+  return result.speak && words.length >= 1 && words.length <= 60 && /^[\x00-\x7F]*$/.test(result.text) && result.evidenceEventIds.length === evidenceIds.length && new Set(result.evidenceEventIds).size === evidenceIds.length && evidenceIds.every((id) => result.evidenceEventIds.includes(id));
+};
+
+function catchUpRecap(db: SQLiteAdapter, sourceId: SourceId, generation: number, requestId: string): CatchUpRecap {
+  const request = one<{ scope_json: string }>(db, "SELECT scope_json FROM catch_up_requests WHERE source_id = ? AND generation = ? AND request_id = ?", sourceId, generation, requestId)!;
+  const scope = JSON.parse(request.scope_json) as ListeningScope;
+  const rows = all<{ participant_id: string; job_id: string | null; capture_json: string; evidence_refs_json: string; observed_at: string; reason: string | null; status: string | null; result_json: string | null; expires_at: string | null }>(db, `SELECT entries.participant_id, entries.job_id, entries.capture_json, entries.evidence_refs_json, entries.observed_at, entries.reason, jobs.status, jobs.result_json, jobs.expires_at
+    FROM catch_up_entries AS entries LEFT JOIN jobs ON jobs.job_id = entries.job_id
+    WHERE entries.source_id = ? AND entries.generation = ? AND entries.request_id = ? ORDER BY entries.participant_id`, sourceId, generation, requestId);
+  const entries = rows.map((row): CatchUpEntry => {
+    const capture = JSON.parse(row.capture_json) as CaptureContext;
+    const evidenceIds = JSON.parse(row.evidence_refs_json) as string[];
+    const base = { participantId: capture.participant.id, location: { sourceId, ...(capture.workspace ? { workspaceId: capture.workspace.id } : {}), ...(capture.tab ? { tabId: capture.tab.id } : {}), ...(capture.pane ? { paneId: capture.pane.id } : {}) }, timestamp: row.observed_at, evidenceRefs: evidenceIds };
+    if (!row.job_id) return { ...base, status: "unavailable", reason: row.reason ?? "unavailable" };
+    if (row.status === "expired" || (row.status === "pending" || row.status === "leased") && row.expires_at !== null && row.expires_at <= now()) return { ...base, status: "failed", reason: "evidence_expired" };
+    if (row.status === "pending" || row.status === "leased") return { ...base, status: "pending", reason: row.reason ?? "processing" };
+    const result = row.result_json ? JSON.parse(row.result_json) as SummaryResult : undefined;
+    if (row.status !== "completed" || !result || !recapText(result, evidenceIds)) return { ...base, status: "failed", reason: "invalid_summary" };
+    return { ...base, status: row.reason ? "partial" : "complete", text: result.text, reason: row.reason ?? "complete" };
+  });
+  const successful = entries.filter((entry) => entry.status === "complete" || entry.status === "partial");
+  const status = entries.some((entry) => entry.status === "pending") ? "pending" : successful.length === 0 ? entries.some((entry) => entry.status === "failed") ? "failed" : "unavailable" : entries.some((entry) => entry.status !== "complete") ? "partial" : "complete";
+  return { status, requestId, generation, scope, entries };
+}
+
 function event(db: SQLiteAdapter, kind: string, value: unknown): number {
   const change = db.run("INSERT INTO durable_events (kind, value_json, created_at) VALUES (?, ?, ?)", kind, JSON.stringify(value), now());
   return Number(change.lastInsertRowid);
@@ -267,7 +300,7 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
         for (const activity of batch.activities) {
           const existing = one<EventRow>(db, "SELECT digest FROM events WHERE event_id = ?", activity.id);
           if (existing) continue;
-          db.run("INSERT INTO events (event_id, source_id, digest, participant_id, source_cursor, observed_at, evidence_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", activity.id, batch.sourceId, hash(activity), activity.participantId, activity.sourceCursor, activity.observedAt, JSON.stringify(activity), new Date(Date.parse(activity.observedAt) + evidenceRetentionMs).toISOString());
+            db.run("INSERT INTO events (event_id, source_id, digest, participant_id, source_cursor, observed_at, evidence_json, expires_at, capture_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", activity.id, batch.sourceId, hash(activity), activity.participantId, activity.sourceCursor, activity.observedAt, JSON.stringify(activity), new Date(Date.parse(activity.observedAt) + evidenceRetentionMs).toISOString(), JSON.stringify(captureContext(batch.topology, activity.participantId)));
           acceptedEventIds.push(activity.id);
           const baseline = one<CursorRow>(db, "SELECT cursor_value, baseline_generation FROM cursors WHERE participant_id = ?", activity.participantId);
           if (batch.listeningGeneration === updatedSource.listening_generation && baseline?.baseline_generation === batch.listeningGeneration && !batch.baselineReady.includes(activity.participantId) && inScope(batch.topology, activity.participantId, scope)) {
@@ -291,8 +324,11 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       }
       const job = one<JobRow>(db, `SELECT candidate.* FROM jobs AS candidate
         WHERE (candidate.status = 'pending' OR (candidate.status = 'leased' AND candidate.lease_expires_at <= ?))
-          AND candidate.expires_at > ?
-          AND candidate.attempts < ?
+            AND candidate.expires_at > ?
+            AND candidate.attempts < ?
+            AND (candidate.catch_up_request_id IS NULL OR EXISTS (
+              SELECT 1 FROM sources AS active WHERE active.source_id = candidate.source_id AND active.scope_json IS NOT NULL AND active.listening_generation = candidate.generation
+            ))
           AND NOT EXISTS (
             SELECT 1 FROM jobs AS active
             WHERE active.source_id = candidate.source_id
@@ -305,12 +341,13 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
             WHERE earlier.source_id = candidate.source_id
               AND earlier.participant_id = candidate.participant_id
               AND earlier.status IN ('pending', 'leased')
+              AND (earlier.catch_up_request_id IS NULL OR earlier.generation = candidate.generation)
               AND earlier.expires_at > ?
               AND earlier.attempts < ?
               AND earlier.rowid < candidate.rowid
           )
-        ORDER BY candidate.created_at, candidate.rowid
-        LIMIT 1`, timestamp, timestamp, maxAttempts, timestamp, timestamp, maxAttempts);
+          ORDER BY candidate.created_at, candidate.rowid
+          LIMIT 1`, timestamp, timestamp, maxAttempts, timestamp, timestamp, maxAttempts);
       if (!job) return { kind: "empty" };
       const leaseToken = randomUUID();
       const expiresAt = after(leaseDurationMs);
@@ -328,17 +365,28 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
         return job.completion_lease_token === completion.leaseToken ? { kind: "duplicate", receipt: JSON.parse(job.receipt_json!) as JobReceipt } : { kind: "conflict", code: "lease_token" };
       }
       if (job.status !== "leased" || job.lease_token !== completion.leaseToken || !job.lease_expires_at || job.lease_expires_at <= now()) return { kind: "conflict", code: "lease_token" };
+      if (job.catch_up_request_id && job.expires_at <= now()) {
+        db.run("UPDATE jobs SET status = 'expired', terminal_outcome = 'evidence_expired', evidence_json = NULL, capture_json = NULL, lease_token = NULL, lease_expires_at = NULL WHERE job_id = ?", jobId);
+        event(db, "expired", { jobId });
+        return { kind: "conflict", code: "lease_token" };
+      }
       const evidence = JSON.parse(job.evidence_json ?? "[]") as Activity[];
-      if (completion.result.evidenceEventIds.length !== evidence.length || completion.result.evidenceEventIds.some((id) => !evidence.some((item) => item.id === id))) return { kind: "conflict", code: "completion_payload" };
-      const source = one<SourceRow>(db, "SELECT * FROM sources WHERE source_id = ?", job.source_id)!;
-      const announcementId = completion.result.speak && source.listening_generation === job.generation ? `announcement:${job.job_id}` : undefined;
+        const exactEvidence = completion.result.evidenceEventIds.length === evidence.length && new Set(completion.result.evidenceEventIds).size === evidence.length && completion.result.evidenceEventIds.every((id) => evidence.some((item) => item.id === id));
+        if (!exactEvidence && !job.catch_up_request_id) return { kind: "conflict", code: "completion_payload" };
+        const source = one<SourceRow>(db, "SELECT * FROM sources WHERE source_id = ?", job.source_id)!;
+        if (job.catch_up_request_id && (source.listening_generation !== job.generation || !source.scope_json)) {
+          db.run("UPDATE jobs SET status = 'expired', terminal_outcome = 'obsolete_generation', lease_token = NULL, lease_expires_at = NULL WHERE job_id = ?", jobId);
+          return { kind: "conflict", code: "lease_token" };
+        }
+        const announcementId = completion.result.speak && !job.catch_up_request_id && source.listening_generation === job.generation ? `announcement:${job.job_id}` : undefined;
       const receipt: JobReceipt = { jobId, ...(announcementId ? { announcementId } : {}), resultKey: completion.resultKey };
-      db.run("UPDATE jobs SET status = 'completed', result_key = ?, result_digest = ?, result_json = ?, receipt_json = ?, completion_lease_token = ?, lease_expires_at = NULL, terminal_expires_at = ? WHERE job_id = ?", completion.resultKey, resultDigest, JSON.stringify(completion.result), JSON.stringify(receipt), completion.leaseToken, after(historyRetentionMs), jobId);
+      const recapResult = !job.catch_up_request_id || recapText(completion.result, evidence.map((item) => item.id));
+      db.run("UPDATE jobs SET status = 'completed', result_key = ?, result_digest = ?, result_json = ?, receipt_json = ?, completion_lease_token = ?, lease_expires_at = NULL, terminal_expires_at = ? WHERE job_id = ?", completion.resultKey, resultDigest, recapResult ? JSON.stringify(completion.result) : null, JSON.stringify(receipt), completion.leaseToken, after(historyRetentionMs), jobId);
       if (announcementId) db.run("INSERT INTO announcements VALUES (?, ?, ?, ?, ?, ?, ?, ?)", announcementId, jobId, job.source_id, job.participant_id, job.generation, JSON.stringify(completion.result), now(), after(historyRetentionMs));
       event(db, "completed", { jobId, ...(announcementId ? { announcementId } : {}) });
       return { kind: "accepted", receipt };
     })),
-    setListeningScope: (selection) => safe("set listening scope", () => transaction(db, () => {
+      setListeningScope: (selection) => safe("set listening scope", () => transaction(db, () => {
       if (!selection) {
         const active = one<SourceRow>(db, "SELECT * FROM sources WHERE scope_json IS NOT NULL LIMIT 1");
         if (!active) return { kind: "unchanged", scope: null, generation: 0 };
@@ -363,10 +411,59 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       const generation = source.scope_json === requested ? source.listening_generation : source.listening_generation + 1;
       db.run("UPDATE sources SET listening_generation = ?, scope_json = ? WHERE source_id = ?", generation, requested, selection.sourceId);
       if (source.scope_json !== requested) db.run("UPDATE cursors SET baseline_generation = NULL WHERE source_id = ?", selection.sourceId);
-      event(db, "listening", { sourceId: selection.sourceId, generation });
-      return { kind: "changed", scope: { ...selection, generation }, generation };
-    })),
-    getState: (query = {}) => safe("get state", () => transaction(db, () => {
+        event(db, "listening", { sourceId: selection.sourceId, generation });
+        return { kind: "changed", scope: { ...selection, generation }, generation };
+      })),
+      requestCatchUp: (request) => safe("request catch up", () => transaction(db, () => {
+        const active = one<SourceRow>(db, "SELECT * FROM sources WHERE scope_json IS NOT NULL LIMIT 1");
+        if (!active) return { kind: "no_joined_scope" };
+        if (active.source_id !== request.sourceId || active.listening_generation !== request.generation) return { kind: "stale_generation" };
+        const scope = currentScope(active)!;
+        const existing = one<{ request_id: string }>(db, "SELECT request_id FROM catch_up_requests WHERE source_id = ? AND generation = ? AND request_id = ?", request.sourceId, request.generation, request.requestId);
+        if (existing) return { kind: "duplicate", recap: catchUpRecap(db, request.sourceId, request.generation, request.requestId) };
+        const acceptedAt = now();
+        db.run("INSERT INTO catch_up_requests (source_id, generation, request_id, scope_json, created_at) VALUES (?, ?, ?, ?, ?)", request.sourceId, request.generation, request.requestId, JSON.stringify(scope), acceptedAt);
+        const cutoff = new Date(Date.parse(acceptedAt) - evidenceRetentionMs).toISOString();
+        const records = all<{ participant_id: string; evidence_json: string; capture_json: string; observed_at: string; expires_at: string }>(db, "SELECT participant_id, evidence_json, capture_json, observed_at, expires_at FROM events WHERE source_id = ? AND evidence_json IS NOT NULL AND capture_json IS NOT NULL AND expires_at > ?", request.sourceId, acceptedAt)
+          .map((row) => ({ ...row, evidence: JSON.parse(row.evidence_json) as Activity, capture: JSON.parse(row.capture_json) as CaptureContext }))
+          .filter((row) => Date.parse(row.observed_at) >= Date.parse(cutoff) && Date.parse(row.observed_at) <= Date.parse(acceptedAt) && captureInScope(row.capture, scope))
+          .sort((left, right) => Date.parse(left.observed_at) - Date.parse(right.observed_at));
+        for (const participantId of [...new Set(records.map((row) => row.participant_id))]) {
+          const participant = records.filter((row) => row.participant_id === participantId);
+          const newest = participant.at(-1)!;
+          let segmentStart = participant.length - 1;
+          while (segmentStart > 0 && participant[segmentStart - 1]!.capture.tab?.id === newest.capture.tab?.id) segmentStart -= 1;
+          const segment = participant.slice(segmentStart);
+          const substantive = segment.filter((row) => row.evidence.status !== "gap" && row.evidence.text.trim().length > 0);
+          if (!substantive.length) {
+            db.run("INSERT INTO catch_up_entries (source_id, generation, request_id, participant_id, job_id, capture_json, evidence_refs_json, observed_at, reason) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)", request.sourceId, request.generation, request.requestId, participantId, JSON.stringify(newest.capture), "[]", newest.observed_at, "incomplete_evidence");
+            continue;
+          }
+          const selected: typeof segment = [];
+          let bytes = 0;
+          for (const row of [...substantive].reverse()) {
+            const formatted = formatEvidence(row.evidence);
+            if (selected.length === 20 || bytes + Buffer.byteLength(formatted) + (selected.length ? 2 : 0) > 20_000) break;
+            selected.push(row);
+            bytes += Buffer.byteLength(formatted) + (selected.length > 1 ? 2 : 0);
+          }
+          selected.sort((left, right) => Date.parse(left.observed_at) - Date.parse(right.observed_at));
+          if (!selected.length) continue;
+          const evidence = selected.map((row) => row.evidence);
+          const omittedSegment = participant.length !== segment.length;
+          const omittedInput = substantive.length !== selected.length;
+          const incomplete = segment.some((row) => row.evidence.status !== "complete" || row.evidence.truncated || row.evidence.excerpt !== "full");
+          const reason = omittedSegment ? "omitted_older_tab_segments" : omittedInput ? "input_limit" : incomplete ? "incomplete_evidence" : null;
+          const inputKey = hash({ catchUp: request, participantId });
+          const jobId = `catchup:${inputKey}`;
+          const expiresAt = selected.map((row) => row.expires_at).sort()[0]!;
+          db.run("INSERT INTO jobs (job_id, input_key, source_id, participant_id, generation, evidence_json, capture_json, status, created_at, expires_at, catch_up_request_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)", jobId, inputKey, request.sourceId, participantId, request.generation, JSON.stringify(evidence), JSON.stringify(newest.capture), acceptedAt, expiresAt, request.requestId);
+          db.run("INSERT INTO catch_up_entries (source_id, generation, request_id, participant_id, job_id, capture_json, evidence_refs_json, observed_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", request.sourceId, request.generation, request.requestId, participantId, jobId, JSON.stringify(newest.capture), JSON.stringify(evidence.map((item) => item.id)), newest.observed_at, reason);
+        }
+        event(db, "catch_up", { sourceId: request.sourceId, generation: request.generation, requestId: request.requestId });
+        return { kind: "accepted", recap: catchUpRecap(db, request.sourceId, request.generation, request.requestId) };
+      })),
+      getState: (query = {}) => safe("get state", () => transaction(db, () => {
       const snapshotAt = now();
       const sources = all<SourceRow>(db, "SELECT * FROM sources ORDER BY source_id");
       const active = sources.find((source) => source.scope_json);
@@ -407,7 +504,8 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       const page = rows.slice(0, limit);
       const ids = page.map((row) => row.job_id);
       const announcements = ids.length ? all<{ announcement_id: string; job_id: string; source_id: string; participant_id: string; created_at: string; summary_json: string }>(db, `SELECT announcement_id, job_id, source_id, participant_id, created_at, summary_json FROM announcements WHERE job_id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at`, ...ids) : [];
-      return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: historyCapture(JSON.parse(row.capture_json) as CaptureContext) })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
+      const recapReasons = new Map((ids.length ? all<{ job_id: string; reason: string | null }>(db, `SELECT job_id, reason FROM catch_up_entries WHERE job_id IN (${ids.map(() => "?").join(",")})`, ...ids) : []).map((row) => [row.job_id, row.reason]));
+      return { announcements: announcements.map((row) => ({ id: row.announcement_id, jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, summary: JSON.parse(row.summary_json) as SummaryResult })), results: page.map((row) => ({ jobId: row.job_id, sourceId: row.source_id as SourceId, participantId: row.participant_id as ParticipantId, createdAt: row.created_at, result: JSON.parse(row.result_json) as SummaryResult, capture: historyCapture(JSON.parse(row.capture_json) as CaptureContext), ...(recapReasons.has(row.job_id) ? { catchUp: { status: recapReasons.get(row.job_id) ? "partial" as const : "complete" as const, reason: recapReasons.get(row.job_id) ?? "complete" } } : {}) })), ...(rows.length > limit ? { nextCursor: String(page.at(-1)!.rowid) } : {}) };
     }),
     getEventsSince: (sequence) => safe("get events", () => {
       const floor = Number(one<{ value: string }>(db, "SELECT value FROM storage_meta WHERE key = 'event_floor'")?.value ?? "1");
@@ -425,6 +523,9 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       const evidence = db.run("UPDATE events SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET result_json = NULL, capture_json = NULL WHERE status = 'completed' AND terminal_expires_at IS NOT NULL AND terminal_expires_at <= ?", timestamp).changes;
       const history = db.run("DELETE FROM announcements WHERE expires_at <= ?", timestamp).changes;
       const eventCutoff = new Date(Date.now() - historyRetentionMs).toISOString();
+      db.run(`DELETE FROM catch_up_entries WHERE (source_id, generation, request_id) IN
+        (SELECT source_id, generation, request_id FROM catch_up_requests WHERE created_at <= ?)
+        AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.job_id = catch_up_entries.job_id AND jobs.result_json IS NOT NULL AND jobs.terminal_expires_at > ?)`, eventCutoff, timestamp);
       const removedThrough = one<{ value: number | null }>(db, "SELECT MAX(sequence) AS value FROM durable_events WHERE created_at <= ?", eventCutoff)?.value;
       db.run("DELETE FROM durable_events WHERE created_at <= ?", eventCutoff);
       if (removedThrough !== null && removedThrough !== undefined) db.run("INSERT INTO storage_meta (key, value) VALUES ('event_floor', ?) ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))", String(Number(removedThrough) + 1));

@@ -4,7 +4,7 @@ import { createErrorReporter } from "./errors";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { Cause, Deferred, Effect, Exit, FiberSet } from "effect";
-import { leaseDurationMs, maxAttempts, openStorage, type HistoryQuery, type IngestBatch, type JobCompletion, type ListeningSelection, type StateQuery, type Storage } from "./storage";
+import { leaseDurationMs, maxAttempts, openStorage, type CatchUpRequest, type HistoryQuery, type IngestBatch, type JobCompletion, type ListeningSelection, type StateQuery, type Storage } from "./storage";
 import { validateSummary } from "./summarizer";
 import { COLLECTOR_WIRE_LIMITS, collectorUtf8Bytes, encodeCollectorJson } from "./shared";
 
@@ -165,6 +165,11 @@ const isListeningSelection = (value: unknown) => {
   return exactKeys(selection, ["sourceId"], ["workspaceId", "tabId"]) && text(selection.sourceId) && workspace !== tab && (!workspace || text(selection.workspaceId)) && (!tab || text(selection.tabId));
 };
 
+const isCatchUpRequest = (value: unknown): value is CatchUpRequest => {
+  const request = record(value);
+  return !!request && exactKeys(request, ["sourceId", "generation", "requestId"]) && text(request.sourceId) && nonnegativeInteger(request.generation) && text(request.requestId);
+};
+
 const validatedCompletion = (value: unknown): JobCompletion | undefined => {
   const completion = record(value);
   const result = completion && record(completion.result);
@@ -310,6 +315,17 @@ const handleListening = (storage: Storage, request: import("node:http").Incoming
   return outcome.kind === "unknown" ? yield* collectorRespond(response, 404, outcome.code) : yield* respond(response, 200, { scope: outcome.scope, generation: outcome.generation });
 });
 
+const handleCatchUp = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
+  if (!sameOrigin(request)) return yield* collectorRespond(response, 403, "origin_forbidden");
+  const body = yield* readCollectorJson(request);
+  if (body.kind === "too_large") return yield* collectorRespond(response, 413, "request_too_large");
+  if (body.kind !== "json" || !isCatchUpRequest(body.value)) return yield* collectorRespond(response, 400, "invalid_request");
+  const outcome = yield* storageOrError(response, storage.requestCatchUp(body.value), { operation: "server.catch_up", sourceId: body.value.sourceId });
+  if (!outcome) return;
+  if (outcome.kind !== "accepted" && outcome.kind !== "duplicate") return yield* collectorRespond(response, 409, outcome.kind);
+  return yield* respond(response, outcome.kind === "accepted" && outcome.recap.status === "pending" ? 202 : 200, outcome.recap);
+});
+
 const handleEvents = (storage: Storage, request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse): Effect.Effect<void> => Effect.gen(function*() {
   const lastEventId = Array.isArray(request.headers["last-event-id"]) ? request.headers["last-event-id"][0] : request.headers["last-event-id"];
   if (!isEventSequence(lastEventId)) return yield* collectorRespond(response, 400, "invalid_request");
@@ -385,6 +401,7 @@ const apiRequest = (storage: Storage, request: import("node:http").IncomingMessa
   if (path === "/api/health") return respond(response, 200, { status: "ok" });
   if (path.startsWith("/api/collector/")) return handleCollector(storage, request, response, path, url);
   if (path === "/api/listening" && request.method === "PUT") return handleListening(storage, request, response);
+  if (path === "/api/catch-up" && request.method === "POST") return handleCatchUp(storage, request, response);
   if (path === "/api/state" && request.method === "GET") return handleState(storage, url, response);
   if (path === "/api/events" && request.method === "GET") return handleEvents(storage, request, response);
   if (path === "/api/history" && request.method === "GET") return handleHistory(storage, url, response);
@@ -495,6 +512,8 @@ const listenServer = (server: ReturnType<typeof createServer>) => Effect.callbac
 
 const serverProgram = Effect.scoped(Effect.gen(function*() {
   const storage = yield* openStorage(dataDir);
+  yield* runStorage(storage.prune(), { operation: "server.prune" });
+  yield* Effect.forkScoped(Effect.forever(Effect.sleep(60 * 60 * 1_000).pipe(Effect.andThen(Effect.suspend(() => runStorage(storage.prune(), { operation: "server.prune" }))))));
   const requests = yield* FiberSet.make<void, never>();
   const dispatch = yield* FiberSet.runtime(requests)<never>();
   const admission = { open: true };

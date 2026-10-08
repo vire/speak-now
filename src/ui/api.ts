@@ -9,6 +9,9 @@ export type CaptureFact = {
 };
 
 export type ListeningScopeResponse = { sourceId: string; workspaceId?: string; tabId?: string; generation: number };
+export type CatchUpRequest = { sourceId: string; generation: number; requestId: string };
+export type CatchUpStatus = "pending" | "partial" | "complete" | "unavailable" | "failed";
+export type CatchUpResponse = { status: CatchUpStatus; requestId: string; generation: number; scope: ListeningScopeResponse; entries: Array<{ participantId: string; location: { sourceId: string; workspaceId?: string; tabId?: string; paneId?: string }; timestamp: string; evidenceRefs: string[]; status: CatchUpStatus; text?: string; reason?: string }> };
 
 export type StateResponse = {
   sources: Array<{ sourceId: string; stale: boolean; observedAt: string; topologySequence: number; listeningGeneration: number }>;
@@ -34,7 +37,7 @@ export type HistoryFilters = {
 
 export type HistoryPage = {
   announcements: Array<{ id: string; jobId: string; sourceId: string; participantId: string; createdAt: string; summary: unknown }>;
-  results: Array<{ jobId: string; sourceId: string; participantId: string; createdAt: string; result: unknown; capture: unknown }>;
+  results: Array<{ jobId: string; sourceId: string; participantId: string; createdAt: string; result: unknown; capture: unknown; catchUp?: { status: "partial" | "complete"; reason: string } }>;
   nextCursor?: string;
 };
 
@@ -46,11 +49,12 @@ export interface BrowserApi {
   readState(sourceId?: string, signal?: AbortSignal): Promise<StateResponse>;
   readHistory(filters: HistoryFilters, signal?: AbortSignal): Promise<HistoryPage>;
   setListening(selection: ListeningSelection, signal?: AbortSignal): Promise<{ scope: ListeningScopeResponse | null; generation: number }>;
+  requestCatchUp(request: CatchUpRequest, signal?: AbortSignal): Promise<CatchUpResponse>;
   openEvents(cursor: number, signal?: AbortSignal): Promise<AsyncIterable<EventNotification>>;
 }
 
 export class BrowserApiError extends Error {
-  constructor(readonly code: "http" | "events_expired" | "malformed_response" | "malformed_stream", readonly status?: number) {
+  constructor(readonly code: "http" | "events_expired" | "malformed_response" | "malformed_stream" | "no_joined_scope" | "stale_generation", readonly status?: number) {
     super(code);
   }
 }
@@ -148,7 +152,8 @@ const historyResponse = async (response: Response): Promise<HistoryPage> => {
   };
   const result = (item: unknown) => {
     const row = record(item);
-    return Boolean(row && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "result") && has(row, "capture"));
+    const recap = row && record(row.catchUp);
+    return Boolean(row && string(row.jobId) && string(row.sourceId) && string(row.participantId) && string(row.createdAt) && has(row, "result") && has(row, "capture") && (!has(row, "catchUp") || recap && (recap.status === "partial" || recap.status === "complete") && string(recap.reason)));
   };
   if (!value || !array(announcements) || !announcements.every(announcement) || !array(results) || !results.every(result) || !optionalString(value.nextCursor)) throw new BrowserApiError("malformed_response");
   return value as HistoryPage;
@@ -159,6 +164,24 @@ const listeningResponse = async (response: Response) => {
   const body = record(value);
   if (!body || !nullableScope(body.scope) || !nonnegativeInteger(body.generation) || (body.scope !== null && body.scope.generation !== body.generation)) throw new BrowserApiError("malformed_response");
   return { scope: body.scope as ListeningScopeResponse | null, generation: body.generation };
+};
+
+const catchUpResponse = async (response: Response): Promise<CatchUpResponse> => {
+  if (!response.ok) {
+    const body = record(await response.json().catch(() => undefined));
+    if (body?.code === "no_joined_scope" || body?.code === "stale_generation") throw new BrowserApiError(body.code, response.status);
+    throw new BrowserApiError("http", response.status);
+  }
+  const body = record(await json(response));
+  const entries = body?.entries;
+  const entry = (value: unknown) => {
+    const item = record(value);
+    const location = item && record(item.location);
+    const recap = item && ["partial", "complete"].includes(item.status as string);
+    return Boolean(item && identifier(item.participantId) && location && identifier(location.sourceId) && (!has(location, "workspaceId") || identifier(location.workspaceId)) && (!has(location, "tabId") || identifier(location.tabId)) && (!has(location, "paneId") || identifier(location.paneId)) && string(item.timestamp) && array(item.evidenceRefs) && item.evidenceRefs.every(identifier) && ["pending", "partial", "complete", "unavailable", "failed"].includes(item.status as string) && (recap ? string(item.text) : !has(item, "text")) && string(item.reason));
+  };
+  if (!body || !["pending", "partial", "complete", "unavailable", "failed"].includes(body.status as string) || !identifier(body.requestId) || !nonnegativeInteger(body.generation) || !scope(body.scope) || body.scope.generation !== body.generation || !array(entries) || !entries.every(entry)) throw new BrowserApiError("malformed_response");
+  return body as CatchUpResponse;
 };
 
 const append = (parameters: URLSearchParams, name: string, value: string | number | undefined) => {
@@ -227,6 +250,9 @@ export const createBrowserApi = (fetcher: BrowserFetch = fetch): BrowserApi => (
       body: JSON.stringify(selection),
       signal,
     }));
+  },
+  async requestCatchUp(request, signal) {
+    return catchUpResponse(await fetcher("/api/catch-up", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal }));
   },
   async openEvents(cursor, signal) {
     const response = await fetcher("/api/events", { headers: { "Last-Event-ID": String(cursor) }, signal });

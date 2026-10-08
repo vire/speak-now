@@ -145,4 +145,32 @@ export const migrations: readonly Migration[] = [
       "CREATE INDEX IF NOT EXISTS jobs_participant_claim ON jobs(source_id, participant_id, status, lease_expires_at)",
     ],
   },
+  {
+    id: 7,
+    statements: [
+      "ALTER TABLE events ADD COLUMN capture_json TEXT",
+      "ALTER TABLE jobs ADD COLUMN catch_up_request_id TEXT",
+      `CREATE TABLE IF NOT EXISTS catch_up_requests (
+        source_id TEXT NOT NULL REFERENCES sources(source_id),
+        generation INTEGER NOT NULL,
+        request_id TEXT NOT NULL,
+        scope_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, generation, request_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS catch_up_entries (
+        source_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        request_id TEXT NOT NULL,
+        participant_id TEXT NOT NULL,
+        job_id TEXT,
+        capture_json TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        reason TEXT,
+        PRIMARY KEY (source_id, generation, request_id, participant_id),
+        FOREIGN KEY (source_id, generation, request_id) REFERENCES catch_up_requests(source_id, generation, request_id)
+      )`,
+    ],
+  },
 ];

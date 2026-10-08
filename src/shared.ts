@@ -84,6 +84,11 @@ export interface Activity {
   trace?: TraceContext;
 }
 
+export function formatEvidence(activity: Activity): string {
+  const revision = activity.revisionOf ? `; revision-of=${activity.revisionOf}; revision=${activity.revisionId}` : "";
+  return `[Evidence id=${activity.id}; capture-status=${activity.status}; excerpt=${activity.excerpt}; original-text-bytes=${activity.originalTextBytes}${revision}]\n${activity.text}`;
+}
+
 export interface ListeningScope {
   sourceId: SourceId;
   workspaceId?: WorkspaceId;
