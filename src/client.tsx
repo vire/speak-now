@@ -29,9 +29,9 @@ function App() {
     createAudio: (url) => new Audio(url),
     report: (event) => {
       if (!event.item.attemptId || event.item.authorizationGeneration === undefined) return Promise.reject(new Error("Playback acknowledgement is missing its attempt receipt"));
-      return browserApi.updatePlaybackAttempt(event.item.attemptId, { state: event.outcome, authorizationGeneration: event.item.authorizationGeneration }).then(() => undefined);
+      return browserSession.acknowledgePlaybackAttempt(event.item.attemptId, { state: event.outcome, authorizationGeneration: event.item.authorizationGeneration }).then(() => undefined);
     },
-  }), [browserApi]);
+  }), [browserSession]);
   const preparedItems = React.useRef(new Set<string>());
   const automaticAttempts = React.useRef(new Map<string, string>());
   const automaticWrites = React.useRef(new Set<string>());

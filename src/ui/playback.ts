@@ -38,6 +38,7 @@ const matchesScope = (candidate: PlaybackCandidate, scope: ListeningScopeRespons
   if (scope.workspaceId) return candidate.workspaceId === scope.workspaceId;
   return candidate.tabId === scope.tabId;
 };
+const sameScope = (left: ListeningScopeResponse | null, right: ListeningScopeResponse | null) => left?.sourceId === right?.sourceId && left?.workspaceId === right?.workspaceId && left?.tabId === right?.tabId && left?.generation === right?.generation;
 
 const muted = (candidate: PlaybackCandidate, settings: PlaybackSettings) => settings.master.muted || settings.participants[candidate.participantId]?.muted === true;
 const key = (candidate: PlaybackCandidate) => candidate.attemptId ?? `${candidate.kind}:${candidate.id}:${candidate.participantId}:${candidate.originGeneration}`;
@@ -154,6 +155,7 @@ export const createScopedPlaybackOwner = ({ createAudio, report }: { createAudio
 
   return {
     sync(input: { scope: ListeningScopeResponse | null; scopeStatus: "idle" | "pending" | "confirmed" | "failed" | "unresolved"; participants: readonly string[]; settings: PlaybackSettings }) {
+      if (input.scopeStatus !== "confirmed" || !sameScope(scope, input.scope)) queued.length = 0;
       scope = input.scope;
       scopeStatus = input.scopeStatus;
       participants = new Set(input.participants);

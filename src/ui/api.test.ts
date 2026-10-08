@@ -64,18 +64,28 @@ test("browser playback transport prepares pending media before it creates and co
   ]);
 });
 
-test("browser playback transport rejects mismatched attempt, state, generation, and unsafe settings receipts", async () => {
-  const api = createBrowserApi(async (input) => {
-    const path = new URL(String(input), "http://speak-now.test").pathname;
-    if (path === "/api/playback/settings") return Response.json({ master: { muted: false, volume: 2, speed: 3 }, participants: [] });
-    if (path.endsWith("/status")) return Response.json({ attemptId: "attempt-other", state: "started", authorizationGeneration: 4 });
-    return Response.json({ attemptId: "attempt-other", state: "prepared", originGeneration: 4, authorizationGeneration: 4, mediaUrl: "/api/playback/attempts/attempt-other/media" });
-  });
+const validPlaybackSettings = { master: { muted: false, volume: 1, speed: 1 }, participants: [] };
+const validPreparedReceipt = { attemptId: "attempt-a", state: "prepared", originGeneration: 4, authorizationGeneration: 4, mediaUrl: "/api/playback/attempts/attempt-a/media" };
+const validHeardReceipt = { attemptId: "attempt-a", state: "heard", authorizationGeneration: 4 };
 
-  await expect(api.readPlaybackSettings("source-a")).rejects.toMatchObject({ code: "malformed_response" });
-  await expect(api.createPlaybackAttempt("attempt-a", { itemId: "announcement:job-a", sourceId: "source-a", participantId: "participant-a", scopeGeneration: 4, intent: "automatic" })).rejects.toMatchObject({ code: "malformed_response" });
-  await expect(api.updatePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 4 })).rejects.toMatchObject({ code: "malformed_response" });
-});
+for (const invalid of [
+  { name: "unsafe master volume", settings: { ...validPlaybackSettings, master: { ...validPlaybackSettings.master, volume: 2 } }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.readPlaybackSettings("source-a") },
+  { name: "unsafe master speed", settings: { ...validPlaybackSettings, master: { ...validPlaybackSettings.master, speed: 3 } }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.readPlaybackSettings("source-a") },
+  { name: "prepared receipt attempt ID", prepared: { ...validPreparedReceipt, attemptId: "attempt-other" }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.createPlaybackAttempt("attempt-a", { itemId: "announcement:job-a", sourceId: "source-a", participantId: "participant-a", scopeGeneration: 4, intent: "automatic" }) },
+  { name: "terminal receipt state", status: { ...validHeardReceipt, state: "started" }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.updatePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 4 }) },
+  { name: "terminal receipt authorization generation", status: { ...validHeardReceipt, authorizationGeneration: 5 }, invoke: (api: ReturnType<typeof createBrowserApi>) => api.updatePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 4 }) },
+]) {
+  test(`browser playback transport rejects one invalid ${invalid.name} field with otherwise valid data`, async () => {
+    const api = createBrowserApi(async (input) => {
+      const path = new URL(String(input), "http://speak-now.test").pathname;
+      if (path === "/api/playback/settings") return Response.json(invalid.settings ?? validPlaybackSettings);
+      if (path.endsWith("/status")) return Response.json(invalid.status ?? validHeardReceipt);
+      return Response.json(invalid.prepared ?? validPreparedReceipt);
+    });
+
+    await expect(invalid.invoke(api)).rejects.toMatchObject({ code: "malformed_response" });
+  });
+}
 
 test("browser API encodes opaque IDs and sends each endpoint its own public DTO", async () => {
   const requests: Array<{ url: URL; init?: RequestInit }> = [];

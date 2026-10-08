@@ -127,6 +127,28 @@ test("automatic ready items queue behind one owner instead of interrupting each 
   expect(outcomes).toEqual(["announcement-a:started", "announcement-a:heard", "announcement-b:started"]);
 });
 
+test("scope uncertainty retires queued items before a delayed stopped acknowledgement can drain them", async () => {
+  const stopped = deferred<void>();
+  const outcomes: string[] = [];
+  const owner = createScopedPlaybackOwner({ createAudio: (url) => new FakeAudio(url), report: (event) => {
+    outcomes.push(`${event.item.id}:${event.outcome}`);
+    return event.item.id === "announcement-a" && event.outcome === "stopped" ? stopped.promise : undefined;
+  } });
+  const settings = { master: { muted: false, volume: 1, rate: 1 }, participants: {} };
+
+  owner.sync({ scope, scopeStatus: "confirmed", participants: ["participant-a", "participant-b"], settings });
+  await owner.enqueue(candidate({ id: "announcement-a" }));
+  await owner.enqueue(candidate({ id: "announcement-b", participantId: "participant-b" }));
+  expect(FakeAudio.instances).toHaveLength(1);
+  owner.sync({ scope: null, scopeStatus: "pending", participants: [], settings });
+  owner.sync({ scope, scopeStatus: "confirmed", participants: ["participant-a", "participant-b"], settings });
+  stopped.resolve();
+  await Bun.sleep(1);
+
+  expect(FakeAudio.instances).toHaveLength(1);
+  expect(outcomes).toEqual(["announcement-a:started", "announcement-a:stopped"]);
+});
+
 test("browser autoplay denial is blocked rather than failed", async () => {
   const outcomes: string[] = [];
   const owner = createScopedPlaybackOwner({ createAudio: (url) => {

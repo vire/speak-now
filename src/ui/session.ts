@@ -242,6 +242,20 @@ export const createBrowserSession = (api: BrowserApi) => {
     }
   };
 
+  const acknowledgePlaybackAttempt = async (attemptId: string, update: { state: Exclude<import("./api").PlaybackStatus, "unattempted" | "prepared">; authorizationGeneration: number }) => {
+    const acknowledgedScope = confirmedScope;
+    const acknowledgementLifecycle = lifecycle;
+    const receipt = await api.updatePlaybackAttempt(attemptId, update);
+    if (stopped || acknowledgementLifecycle !== lifecycle || !sameScope(confirmedScope, acknowledgedScope)) return receipt;
+    try {
+      await Promise.all([refreshPlayback(), refreshHistory()]);
+    } catch (error) {
+      transportError = error instanceof Error ? error.message : "playback_refresh_failed";
+      publish();
+    }
+    return receipt;
+  };
+
   const startStream = (cursor: number) => {
     stopStream();
     const owner = ++streamOwner;
@@ -464,6 +478,7 @@ export const createBrowserSession = (api: BrowserApi) => {
     },
       catchUp: requestCatchUp,
       refreshPlayback,
+      acknowledgePlaybackAttempt,
       preparePlaybackItem,
       authorizePlayback,
       setPlaybackSettings,

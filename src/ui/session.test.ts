@@ -179,6 +179,39 @@ test("playback session prepares pending media before it authorizes a client-owne
   expect(attempt).toMatchObject({ attemptId: "attempt-a", mediaUrl: "/api/playback/attempts/attempt-a/media" });
 });
 
+test("a durable Heard receipt refreshes idle candidates and the active history filter without collector SSE", async () => {
+  const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
+  let heard = false;
+  const api: BrowserApi = {
+    readState: async (sourceId) => state(sourceId ?? sourceA, 1, joined),
+    readHistory: async (filters) => ({
+      announcements: heard && filters.playbackStatus === "heard"
+        ? [{ id: "announcement:job-a", jobId: "job-a", sourceId: sourceA, participantId: "participant-a", createdAt: "2026-10-08T12:00:00.000Z", summary: {}, playback: { status: "heard" as const } }]
+        : [],
+      results: [],
+    }),
+    setListening: async () => ({ scope: joined, generation: 7 }),
+    openEvents: async () => idleEvents(),
+    readPlaybackSettings: async () => ({ master: { muted: false, volume: 1, speed: 1 }, participants: [] }),
+    readPlaybackCandidates: async () => ({ scope: joined, candidates: [{ itemId: "announcement:job-a", kind: "announcement", sourceId: sourceA, workspaceId: "workspace-a", participantId: "participant-a", originGeneration: 7, createdAt: "2026-10-08T12:00:00.000Z", media: { state: "ready", id: "a".repeat(64) }, playback: { status: heard ? "heard" : "unattempted" } }] }),
+    updatePlaybackAttempt: async (attemptId, update) => {
+      heard = update.state === "heard";
+      return { attemptId, state: update.state, authorizationGeneration: update.authorizationGeneration };
+    },
+  };
+  const session = sessionFor(api);
+
+  await session.start(sourceA);
+  await session.setHistoryFilters({ order: "desc", limit: 50, playbackStatus: "heard" });
+  expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("unattempted");
+  expect(session.snapshot().history.announcements).toEqual([]);
+
+  await session.acknowledgePlaybackAttempt("attempt-a", { state: "heard", authorizationGeneration: 7 });
+
+  expect(session.snapshot().playback?.candidates[0]?.playback?.status).toBe("heard");
+  expect(session.snapshot().history.announcements).toMatchObject([{ playback: { status: "heard" } }]);
+});
+
 test("a delayed playback settings read cannot undo an optimistic accepted mute", async () => {
   const joined = { sourceId: sourceA, workspaceId: "workspace-a", generation: 7 };
   const delayedRead = deferred<{ master: { muted: boolean; volume: number; speed: number }; participants: [] }>();
