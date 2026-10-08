@@ -117,6 +117,19 @@ const batch = (overrides: Record<string, unknown> = {}) => ({
 const postBatch = (origin: string, value: Record<string, unknown>) => fetch(`${origin}/api/collector/batches`, { method: "POST", headers: collectorHeaders, body: JSON.stringify(value) });
 const requestCatchUp = (origin: string, value: { sourceId: string; generation: number; requestId: string }) => fetch(`${origin}/api/catch-up`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
 
+test("playback settings rejects malformed supplied sections without mutating settings", async () => {
+  const runtime = await startServer("collector-test-token");
+  try {
+    expect((await postBatch(runtime.origin, batch())).status).toBe(201);
+    const url = `${runtime.origin}/api/playback/settings?sourceId=${encodeURIComponent(sourceId)}`;
+    for (const body of [{ master: null }, { participant: "bad" }, { master: { muted: true }, participant: "bad" }]) {
+      const response = await fetch(`${runtime.origin}/api/playback/settings`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      expect(response.status).toBe(400);
+      expect(await (await fetch(url)).json()).toEqual({ master: { muted: false, volume: 1, speed: 1 }, participants: [] });
+    }
+  } finally { await stopServer(runtime); }
+}, 15_000);
+
 const activity = (id: string, cursor: string) => ({
   id,
   participantId,
@@ -309,11 +322,42 @@ test("provider failure marks scoped media failed and leaves it retryable", async
   }
 }, 15_000);
 
+test("provider failure after Leave returns stale_generation without leaving prepare unresolved", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-provider-leave-"));
+  const startedPath = join(fixtureRoot, "provider-started");
+  const releasePath = join(fixtureRoot, "provider-release");
+  const preload = join(fixtureRoot, "speech-leave.ts");
+  await writeFile(preload, `const originalFetch = globalThis.fetch; globalThis.fetch = async (input, init) => { if (!String(input).startsWith("https://api.elevenlabs.io/")) return originalFetch(input, init); await Bun.write(process.env.SPEECH_STARTED_PATH!, "started"); while (!(await Bun.file(process.env.SPEECH_RELEASE_PATH!).exists())) await Bun.sleep(5); return new Response("unavailable", { status: 503 }); };`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice", SPEECH_STARTED_PATH: startedPath, SPEECH_RELEASE_PATH: releasePath } });
+  try {
+    const job = await prepareClaimedJob(runtime.origin);
+    expect((await fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: job.leaseToken, resultKey: "provider-leave", result: { speak: true, kind: "progress", text: "Leave failure fixture", evidenceEventIds: ["event-a"] } }) })).status).toBe(201);
+    const page = await (await fetch(`${runtime.origin}/api/playback/candidates?limit=1`)).json() as { scope: { generation: number }; candidates: Array<{ itemId: string }> };
+    const item = page.candidates.at(0);
+    if (!item) throw new Error("missing provider failure candidate");
+    const request = { sourceId, participantId, scopeGeneration: page.scope.generation };
+    const controller = new AbortController();
+    const pending = fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal: controller.signal });
+    for (let attempt = 0; attempt < 100 && !(await Bun.file(startedPath).exists()); attempt += 1) await Bun.sleep(5);
+    expect(await Bun.file(startedPath).exists()).toBe(true);
+    expect((await fetch(`${runtime.origin}/api/listening`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: "null" })).status).toBe(200);
+    await writeFile(releasePath, "release");
+    const response = await Promise.race([pending, Bun.sleep(600).then(() => { controller.abort(); throw new Error("prepare did not settle after stale provider failure"); })]);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ code: "stale_generation" });
+  } finally {
+    await stopServer(runtime);
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("cancelled media preparation releases its token for an immediate scoped retry", async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "speak-now-server-provider-cancel-"));
+  const startedPath = join(fixtureRoot, "provider-started");
+  const abortedPath = join(fixtureRoot, "provider-aborted");
   const preload = join(fixtureRoot, "speech-cancel.ts");
-  await writeFile(preload, `let calls = 0; const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => { if (!String(input).startsWith("https://api.elevenlabs.io/")) return originalFetch(input, init); calls += 1; if (calls > 1) return Promise.resolve(new Response(new Uint8Array([73, 68, 51]), { status: 200, headers: { "Content-Type": "audio/mpeg" } })); return new Promise((resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true })); };`);
-  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice" } });
+  await writeFile(preload, `let calls = 0; const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => { if (!String(input).startsWith("https://api.elevenlabs.io/")) return originalFetch(input, init); calls += 1; if (calls > 1) return Promise.resolve(new Response(new Uint8Array([73, 68, 51]), { status: 200, headers: { "Content-Type": "audio/mpeg" } })); return Bun.write(process.env.SPEECH_STARTED_PATH!, "started").then(() => new Promise((resolve, reject) => init?.signal?.addEventListener("abort", () => Bun.write(process.env.SPEECH_ABORTED_PATH!, "aborted").then(() => reject(new DOMException("aborted", "AbortError"))), { once: true }))); };`);
+  const runtime = await startServer("collector-test-token", { preload, env: { ELEVENLABS_API_KEY: "fixture-key", ELEVENLABS_VOICE_ID: "fixture-voice", SPEECH_STARTED_PATH: startedPath, SPEECH_ABORTED_PATH: abortedPath } });
   try {
     const job = await prepareClaimedJob(runtime.origin);
     expect((await fetch(`${runtime.origin}/api/collector/jobs/${job.jobId}/result`, { method: "POST", headers: collectorHeaders, body: JSON.stringify({ leaseToken: job.leaseToken, resultKey: "provider-cancel", result: { speak: true, kind: "progress", text: "Cancellation fixture", evidenceEventIds: ["event-a"] } }) })).status).toBe(201);
@@ -321,18 +365,16 @@ test("cancelled media preparation releases its token for an immediate scoped ret
     const item = page.candidates.at(0);
     if (!item) throw new Error("missing cancellation candidate");
     const request = { sourceId, participantId, scopeGeneration: page.scope.generation };
-    const cancelled = new Promise<void>((resolve) => {
-      const pending = httpRequest(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" } });
-      pending.once("error", () => resolve());
-      pending.once("close", () => resolve());
-      pending.end(JSON.stringify(request));
-      setTimeout(() => pending.destroy(), 20);
-    });
-    await cancelled;
-    await Bun.sleep(20);
+    const controller = new AbortController();
+    const pending = fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request), signal: controller.signal });
+    for (let attempt = 0; attempt < 100 && !(await Bun.file(startedPath).exists()); attempt += 1) await Bun.sleep(5);
+    expect(await Bun.file(startedPath).exists()).toBe(true);
+    controller.abort();
+    await pending.catch(() => undefined);
     const retry = await fetch(`${runtime.origin}/api/playback/items/${encodeURIComponent(item.itemId)}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request) });
     expect(retry.status).toBe(200);
     expect(await retry.json()).toMatchObject({ media: { state: "ready" } });
+    expect(await Bun.file(abortedPath).exists()).toBe(true);
   } finally {
     await stopServer(runtime);
     await rm(fixtureRoot, { recursive: true, force: true });

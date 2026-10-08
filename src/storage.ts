@@ -294,10 +294,10 @@ function playbackCandidates(db: SQLiteAdapter, query: PlaybackCandidatesQuery, i
   }
   if (query.cursor) add(`jobs.rowid ${direction === "ASC" ? ">" : "<"} ?`, Number(query.cursor));
   const rows = all<PlaybackCandidateRow>(db, `SELECT jobs.rowid, jobs.job_id, jobs.source_id, jobs.participant_id, jobs.generation, jobs.result_json, jobs.capture_json, jobs.created_at, announcements.announcement_id, media_items.state AS media_state, media_items.media_id,
-    (SELECT attempt_id FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY updated_at DESC, rowid DESC LIMIT 1) AS attempt_id,
-    (SELECT state FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY updated_at DESC, rowid DESC LIMIT 1) AS attempt_state,
-    (SELECT origin_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY updated_at DESC, rowid DESC LIMIT 1) AS attempt_origin_generation,
-    (SELECT authorization_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY updated_at DESC, rowid DESC LIMIT 1) AS attempt_authorization_generation
+    (SELECT attempt_id FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_id,
+    (SELECT state FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_state,
+    (SELECT origin_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_origin_generation,
+    (SELECT authorization_generation FROM playback_attempts WHERE item_id = media_items.item_id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS attempt_authorization_generation
     FROM jobs LEFT JOIN announcements ON announcements.job_id = jobs.job_id LEFT JOIN media_items ON media_items.job_id = jobs.job_id
     WHERE ${predicates.join(" AND ")} ORDER BY jobs.rowid ${direction} LIMIT ?`, ...values, itemId ? 1 : limit + 1);
   const page = rows.slice(0, itemId ? 1 : limit);
@@ -317,7 +317,7 @@ function event(db: SQLiteAdapter, kind: string, value: unknown): number {
   return Number(change.lastInsertRowid);
 }
 
-async function pruneMedia(dataDir: string): Promise<number> {
+async function pruneMedia(dataDir: string, retained: ReadonlySet<string>): Promise<number> {
   const audio = join(dataDir, "audio");
   let entries: string[];
   try { entries = await readdir(audio); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
@@ -326,7 +326,8 @@ async function pruneMedia(dataDir: string): Promise<number> {
     const path = join(audio, name);
     const info = await stat(path);
     if (info.isDirectory()) continue;
-    if (name.endsWith(".partial") || name.endsWith(".tmp") || info.mtimeMs <= Date.now() - evidenceRetentionMs) {
+    const mediaId = name.endsWith(".mp3") ? name.slice(0, -4) : undefined;
+    if (name.endsWith(".partial") || name.endsWith(".tmp") || info.mtimeMs <= Date.now() - evidenceRetentionMs && (!mediaId || !retained.has(mediaId))) {
       await rm(path, { force: true });
       removed += 1;
     }
@@ -601,13 +602,13 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       if (query.participantId) add("participant_id = ?", query.participantId);
       if (query.from) add("created_at >= ?", query.from);
       if (query.to) add("created_at <= ?", query.to);
-      if (query.playbackStatus) add("COALESCE((SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.updated_at DESC, attempt.rowid DESC LIMIT 1), 'unattempted') = ?", query.playbackStatus);
+      if (query.playbackStatus) add("COALESCE((SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1), 'unattempted') = ?", query.playbackStatus);
       if (query.cursor) add(`rowid ${direction === "DESC" ? "<" : ">"} ?`, Number(query.cursor));
       const rows = all<{ rowid: number; job_id: string; source_id: string; participant_id: string; created_at: string; result_json: string; capture_json: string; attempt_id: string | null; attempt_state: PlaybackAttemptState | null; attempt_origin_generation: number | null; attempt_authorization_generation: number | null }>(db, `SELECT jobs.rowid, jobs.job_id, jobs.source_id, jobs.participant_id, jobs.created_at, jobs.result_json, jobs.capture_json,
-        (SELECT attempt_id FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.updated_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_id,
-        (SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.updated_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_state,
-        (SELECT origin_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.updated_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_origin_generation,
-        (SELECT authorization_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.updated_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_authorization_generation
+        (SELECT attempt_id FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_id,
+        (SELECT attempt.state FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_state,
+        (SELECT origin_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_origin_generation,
+        (SELECT authorization_generation FROM playback_attempts AS attempt JOIN media_items AS media ON media.item_id = attempt.item_id WHERE media.job_id = jobs.job_id ORDER BY attempt.created_at DESC, attempt.rowid DESC LIMIT 1) AS attempt_authorization_generation
         FROM jobs WHERE ${predicates.join(" AND ")} ORDER BY jobs.rowid ${direction} LIMIT ?`, ...values, limit + 1);
       const page = rows.slice(0, limit);
       const ids = page.map((row) => row.job_id);
@@ -707,8 +708,8 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       return { kind: "events", events: rows.map((row) => ({ sequence: row.sequence, kind: row.kind, value: JSON.parse(row.value_json) })), latestSequence };
     }),
     prune: () => Effect.tryPromise({ try: async () => {
-      const pruned = transaction(db, () => {
       const timestamp = now();
+      const pruned = transaction(db, () => {
       const pending = db.run("UPDATE jobs SET status = 'expired', evidence_json = NULL, capture_json = NULL, lease_token = NULL, lease_expires_at = NULL WHERE status IN ('pending', 'leased') AND expires_at <= ?", timestamp).changes;
       const evidence = db.run("UPDATE events SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET evidence_json = NULL WHERE evidence_json IS NOT NULL AND expires_at <= ?", timestamp).changes + db.run("UPDATE jobs SET result_json = NULL, capture_json = NULL WHERE status = 'completed' AND terminal_expires_at IS NOT NULL AND terminal_expires_at <= ?", timestamp).changes;
       const history = db.run("DELETE FROM announcements WHERE expires_at <= ?", timestamp).changes;
@@ -722,7 +723,14 @@ function makeStorage(db: SQLiteAdapter, dataDir: string): Storage {
       if (pending || history) event(db, "pruned", { pending, evidence, history });
       return { expiredEvidence: evidence, expiredHistory: history, expiredMedia: 0, terminalizedJobs: pending };
       });
-      return { ...pruned, expiredMedia: await pruneMedia(dataDir) };
+      const retained = new Set(all<{ media_id: string }>(db, `SELECT media.media_id FROM media_items AS media
+        JOIN jobs ON jobs.job_id = media.job_id
+        LEFT JOIN announcements ON announcements.job_id = jobs.job_id
+        WHERE media.state = 'ready' AND media.media_id IS NOT NULL
+          AND jobs.status = 'completed' AND jobs.result_json IS NOT NULL AND jobs.capture_json IS NOT NULL
+          AND jobs.terminal_expires_at > ? AND json_extract(jobs.result_json, '$.speak') = 1
+          AND (announcements.announcement_id IS NOT NULL OR jobs.catch_up_request_id IS NOT NULL)`, timestamp).map((row) => row.media_id));
+      return { ...pruned, expiredMedia: await pruneMedia(dataDir, retained) };
     }, catch: (cause) => new StorageError("prune", cause) }),
   };
 }

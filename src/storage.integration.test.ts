@@ -87,6 +87,90 @@ const establishBaseline = (storage: Storage) => Effect.gen(function*() {
   expect(yield* storage.ingestBatch(batch({ batchId: "baseline-a", baselineReady: [participantId], cursors: [{ participantId, previous: "cursor:seed", next: "cursor:baseline" }], activities: [] }))).toMatchObject({ kind: "accepted" });
 });
 
+test("delayed older terminal attempt cannot replace newer replay Heard", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const outcome = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch());
+      const job = yield* storage.claimJob("worker");
+      if (job.kind !== "claimed") throw new Error("expected job");
+      yield* storage.completeJob(job.job.id, { leaseToken: job.job.leaseToken, resultKey: "result", result: { speak: true, kind: "progress", text: "ready", evidenceEventIds: ["event-a"] } });
+      const candidate = (yield* storage.getPlaybackCandidates({})).candidates[0];
+      if (!candidate) throw new Error("expected candidate");
+      const preparing = yield* storage.preparePlaybackMedia({ itemId: candidate.itemId, sourceId, participantId, scopeGeneration: 1 });
+      if (preparing.kind !== "prepare") throw new Error("expected preparation");
+      yield* storage.completePlaybackMedia(candidate.itemId, preparing.token, "a".repeat(64));
+      yield* storage.createPlaybackAttempt({ attemptId: "older", itemId: candidate.itemId, sourceId, participantId, scopeGeneration: 1, intent: "automatic" });
+      yield* storage.updatePlaybackAttempt("older", "started", 1);
+      yield* storage.createPlaybackAttempt({ attemptId: "newer", itemId: candidate.itemId, sourceId, participantId, scopeGeneration: 1, intent: "replay" });
+      yield* storage.updatePlaybackAttempt("newer", "started", 1);
+      yield* storage.updatePlaybackAttempt("newer", "heard", 1);
+      setClockOffset(1_000);
+      yield* storage.updatePlaybackAttempt("older", "stopped", 1);
+      return { candidates: yield* storage.getPlaybackCandidates({}), history: yield* storage.getHistory({ playbackStatus: "heard" }) };
+    }));
+    expect(outcome.candidates.candidates[0]?.playback).toMatchObject({ attemptId: "newer", status: "heard" });
+    expect(outcome.history.results).toHaveLength(1);
+  } finally { restoreClock(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test("prune retains ready media referenced by a playable job", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  try {
+    const prepared = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch());
+      const job = yield* storage.claimJob("worker");
+      if (job.kind !== "claimed") throw new Error("expected job");
+      yield* storage.completeJob(job.job.id, { leaseToken: job.job.leaseToken, resultKey: "result", result: { speak: true, kind: "progress", text: "ready", evidenceEventIds: ["event-a"] } });
+      const candidate = (yield* storage.getPlaybackCandidates({})).candidates[0];
+      if (!candidate) throw new Error("expected candidate");
+      const preparation = yield* storage.preparePlaybackMedia({ itemId: candidate.itemId, sourceId, participantId, scopeGeneration: 1 });
+      if (preparation.kind !== "prepare") throw new Error("expected preparation");
+      yield* storage.completePlaybackMedia(candidate.itemId, preparation.token, "a".repeat(64));
+      return candidate.itemId;
+    }));
+    const path = join(dataDir, "audio", `${"a".repeat(64)}.mp3`);
+    await mkdir(join(dataDir, "audio"), { recursive: true });
+    await writeFile(path, "audio");
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+    await utimes(path, old, old);
+    const outcome = await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* storage.prune();
+      return yield* storage.getPlaybackCandidates({});
+    }));
+    expect(await Bun.file(path).exists()).toBe(true);
+    expect(outcome.candidates.find((candidate) => candidate.itemId === prepared)?.media.state).toBe("ready");
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test("prune removes ready media after its completed playable record expires", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
+  const mediaId = "b".repeat(64);
+  const path = join(dataDir, "audio", `${mediaId}.mp3`);
+  try {
+    await useStorage(dataDir, (storage) => Effect.gen(function*() {
+      yield* establishBaseline(storage);
+      yield* storage.ingestBatch(batch());
+      const job = yield* storage.claimJob("worker");
+      if (job.kind !== "claimed") throw new Error("expected job");
+      yield* storage.completeJob(job.job.id, { leaseToken: job.job.leaseToken, resultKey: "result", result: { speak: true, kind: "progress", text: "ready", evidenceEventIds: ["event-a"] } });
+      const candidate = (yield* storage.getPlaybackCandidates({})).candidates[0];
+      if (!candidate) throw new Error("expected candidate");
+      const preparation = yield* storage.preparePlaybackMedia({ itemId: candidate.itemId, sourceId, participantId, scopeGeneration: 1 });
+      if (preparation.kind !== "prepare") throw new Error("expected preparation");
+      yield* storage.completePlaybackMedia(candidate.itemId, preparation.token, mediaId);
+    }));
+    await mkdir(join(dataDir, "audio"), { recursive: true });
+    await writeFile(path, "audio");
+    setClockOffset(31 * 24 * 60 * 60 * 1_000);
+    const pruned = await useStorage(dataDir, (storage) => storage.prune());
+    expect(pruned.expiredMedia).toBe(1);
+    expect(await Bun.file(path).exists()).toBe(false);
+  } finally { restoreClock(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
 test("reopened exact batch retry keeps one durable activity acknowledgement and job", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "speak-now-storage-"));
   try {
@@ -195,7 +279,7 @@ test("Catch up completion cannot turn expired evidence into a successful recap",
   try {
     const recapJob = await useStorage(dataDir, (storage) => Effect.gen(function*() {
       yield* establishBaseline(storage);
-      yield* storage.ingestBatch(batch());
+      yield* storage.ingestBatch(batch({ activities: [activity("event-a", "cursor:activity", new Date(Date.now() - 1_000).toISOString())] }));
       const automatic = yield* storage.claimJob("worker-a");
       if (automatic.kind !== "claimed") throw new Error("expected automatic job");
       yield* storage.completeJob(automatic.job.id, { leaseToken: automatic.job.leaseToken, resultKey: "automatic", result: { speak: false, kind: "progress", text: "stored", evidenceEventIds: ["event-a"] } });
@@ -240,7 +324,7 @@ test("expired lease token cannot complete a job claimed again by another worker"
   try {
     const outcome = await useStorage(dataDir, (storage) => Effect.gen(function*() {
       yield* establishBaseline(storage);
-      yield* storage.ingestBatch(batch({ activities: [activity("event-a", "cursor:activity", new Date(Date.now() - 1_000).toISOString())] }));
+      yield* storage.ingestBatch(batch());
       const initial = yield* storage.claimJob("worker-a");
       expect(initial.kind).toBe("claimed");
       if (initial.kind !== "claimed") throw new Error("expected initial claim");
